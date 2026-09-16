@@ -1951,3 +1951,42 @@ fn completion_models_cte_derived_and_temporary_relation_columns() {
         "{dropped_result}"
     );
 }
+
+#[test]
+fn local_query_shapes_complete_before_from_without_database_metadata() {
+    let mut lsp = LspProcess::spawn();
+    lsp.initialize();
+    for (index, marked, expected) in [
+        (0, "SELECT sq.| FROM (SELECT 1 AS item_id) sq", "item_id"),
+        (1, "WITH a AS MATERIALIZED (SELECT 1 AS item_id), b AS (SELECT * FROM a) SELECT b.| FROM b", "item_id"),
+        (2, "WITH RECURSIVE chain(id) AS (SELECT 1 UNION ALL SELECT chain.| FROM chain)", "id"),
+    ] {
+        let uri = format!("oxide://query/local-{index}.postgres.sql");
+        let offset = marked.find('|').unwrap();
+        let sql = marked.replacen('|', "", 1);
+        lsp.open(&uri, "postgres", &sql);
+        let result = lsp.request("textDocument/completion", json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": utf16_column(&sql, offset) }
+        }));
+        let items = result.as_array().or_else(|| result.get("items").and_then(Value::as_array)).expect("completion list");
+        assert!(items.iter().any(|item| item["label"].as_str().is_some_and(|label| label == expected || label.ends_with(&format!(".{expected}")))), "{marked}: {result}");
+    }
+}
+
+#[test]
+fn local_derived_definition_keeps_query_uri_and_line() {
+    let mut lsp = LspProcess::spawn();
+    lsp.initialize();
+    let uri = "oxide://query/local-definition.postgres.sql";
+    let sql = "-- 😀\nSELECT sq.item_id\nFROM (SELECT 1 AS item_id) sq";
+    lsp.open(uri, "postgres", sql);
+    let result = lsp.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": uri }, "position": { "line": 1, "character": 11 }
+        }),
+    );
+    assert_eq!(result["uri"], uri, "{result}");
+    assert_eq!(result["range"]["start"]["line"], 2, "{result}");
+}
