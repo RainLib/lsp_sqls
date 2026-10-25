@@ -6,6 +6,8 @@ use crate::schema::{Function, Schema, Table};
 fn test_schema() -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "app".to_string(),
         server_version: None,
@@ -51,6 +53,7 @@ fn test_schema() -> Schema {
             name: "calculate_score".to_string(),
             routine_type: Some("function".to_string()),
             parameters: vec![FunctionParameter {
+                mode: None,
                 name: "user_id".to_string(),
                 data_type: "integer".to_string(),
                 optional: false,
@@ -403,4 +406,79 @@ fn parser_active_statement_start_preserves_ctes_set_operations_and_sql_noise() {
             "should not split: {sql}"
         );
     }
+}
+
+#[test]
+fn foreign_key_templates_do_not_treat_cte_projection_as_catalog_constraints() {
+    let mut schema = test_schema();
+    let orders = schema
+        .tables
+        .iter_mut()
+        .find(|table| table.name == "orders")
+        .unwrap();
+    orders.columns.push(Column {
+        name: "user_id".into(),
+        data_type: "integer".into(),
+        ..Default::default()
+    });
+    orders.constraints = vec![crate::schema::Constraint {
+        name: "orders_user".into(),
+        constraint_type: "FOREIGN KEY".into(),
+        columns: vec!["user_id".into()],
+        referenced_table: Some("users".into()),
+        referenced_columns: vec!["id".into()],
+        ..Default::default()
+    }];
+    crate::relation_bindings::install(
+        &mut schema,
+        Table {
+            name: "users".into(),
+            object_type: Some("COMMON TABLE EXPRESSION".into()),
+            columns: vec![Column {
+                name: "different_key".into(),
+                data_type: "text".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let mut items = Vec::new();
+    add_foreign_key_join_snippets(
+        &mut items,
+        &schema,
+        &["users".into()],
+        &std::collections::HashMap::new(),
+        "",
+        false,
+    );
+    assert!(items.is_empty(), "{items:?}");
+    add_foreign_key_join_snippets(
+        &mut items,
+        &schema,
+        &["app.users".into()],
+        &std::collections::HashMap::new(),
+        "",
+        false,
+    );
+    assert!(
+        !items.is_empty(),
+        "qualified physical FK metadata remains available"
+    );
+    items.clear();
+    add_foreign_key_join_snippets(
+        &mut items,
+        &schema,
+        &["orders".into()],
+        &std::collections::HashMap::new(),
+        "",
+        false,
+    );
+    assert!(
+        items.iter().all(|item| item
+            .insert_text
+            .as_ref()
+            .is_some_and(|text| text.starts_with("app.users "))),
+        "{items:?}"
+    );
+    assert!(!items.is_empty());
 }

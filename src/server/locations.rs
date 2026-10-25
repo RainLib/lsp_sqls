@@ -1,7 +1,6 @@
 //! Locations for the SQL language server.
 use super::completion_context::position_to_byte_offset;
 use super::limits::{CURRENT_JSON_DOCUMENT_URI, CURRENT_SQL_DOCUMENT_URI};
-use crate::parser::SqlParser;
 use std::collections::HashSet;
 use tower_lsp::lsp_types::*;
 pub(super) fn rewrite_current_document_location_uri(location: &mut Location, document_uri: &Url) {
@@ -50,20 +49,6 @@ pub(super) fn identifier_at_position(
     (!identifier.is_empty()).then_some(identifier)
 }
 
-pub(super) fn cte_identifier_range_at_position(
-    text: &str,
-    position: Position,
-    dialect: &str,
-) -> Option<Range> {
-    let identifier = identifier_at_position(text, position, dialect)?;
-    let parser = SqlParser::new();
-    parser
-        .extract_common_table_expressions(text)
-        .into_iter()
-        .any(|cte| SqlParser::identifier_last_part(&cte).eq_ignore_ascii_case(&identifier))
-        .then(|| identifier_range_at_position(text, position, dialect))?
-}
-
 pub(super) fn is_identifier_character(character: char, dialect: &str) -> bool {
     character.is_alphanumeric()
         || character == '_'
@@ -97,7 +82,10 @@ pub(super) fn deduplicate_locations(locations: &mut Vec<Location>) {
 }
 
 pub(super) fn supports_semantic_rename(dialect: &str) -> bool {
-    matches!(dialect, "postgres" | "mysql" | "clickhouse" | "hive")
+    matches!(
+        dialect,
+        "postgres" | "mysql" | "clickhouse" | "hive" | "sqlserver"
+    )
 }
 
 pub(super) fn workspace_symbol_matches(query: &str, name: &str, container: &str) -> bool {

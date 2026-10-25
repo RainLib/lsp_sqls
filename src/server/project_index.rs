@@ -269,7 +269,7 @@ pub(super) fn read_project_identifier_path_after(
         }
         let after_dot = skip_local_whitespace(source, dot + 1);
         if source[after_dot..].starts_with('.') {
-            parts.push("dbo".to_string());
+            parts.push(String::new());
             path_end = after_dot;
             continue;
         }

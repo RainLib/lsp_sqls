@@ -8,7 +8,7 @@ pub(super) fn initialize_result(
     completion_documentation_resolve_supported: &AtomicBool,
 ) -> InitializeResult {
     completion_documentation_resolve_supported.store(
-        client_supports_completion_documentation_resolve(&params),
+        client_supports_completion_documentation_resolve(params),
         Ordering::Relaxed,
     );
     InitializeResult {
@@ -17,18 +17,31 @@ pub(super) fn initialize_result(
             version: Some("0.1.0".to_string()),
         }),
         capabilities: ServerCapabilities {
+            experimental: Some(
+                serde_json::json!({"oxideAnalysisConfiguration":{"version":1},"oxideDiagnosticSnapshots":{"version":1,"syntaxWithoutMetadata":true}}),
+            ),
             text_document_sync: Some(TextDocumentSyncCapability::Kind(
                 TextDocumentSyncKind::INCREMENTAL,
             )),
             completion_provider: Some(CompletionOptions {
                 resolve_provider: Some(true),
-                trigger_characters: Some(vec![".".to_string(), " ".to_string(), "(".to_string()]),
+                trigger_characters: Some(vec![
+                    ".".to_string(),
+                    " ".to_string(),
+                    "(".to_string(),
+                    "@".to_string(),
+                ]),
                 ..Default::default()
             }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             signature_help_provider: Some(SignatureHelpOptions {
-                trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
-                retrigger_characters: Some(vec![",".to_string()]),
+                trigger_characters: Some(vec![
+                    "(".to_string(),
+                    ",".to_string(),
+                    " ".to_string(),
+                    "=".to_string(),
+                ]),
+                retrigger_characters: Some(vec![",".to_string(), "=".to_string()]),
                 ..Default::default()
             }),
             definition_provider: Some(OneOf::Left(true)),

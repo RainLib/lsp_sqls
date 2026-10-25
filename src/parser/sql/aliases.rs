@@ -12,10 +12,21 @@ impl SqlParser {
 
     pub fn extract_aliases_at_position(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         source: &str,
         position: Position,
     ) -> HashMap<String, String> {
+        if self.uses_joined_scope(tree, source, position) {
+            return self
+                .relation_scope_for_member(tree, source, position)
+                .map(|s| {
+                    s.aliases
+                        .into_iter()
+                        .map(|a| (a.name, a.relation))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         Self::relation_aliases_at_position(source, position)
             .into_iter()
             .map(|alias| (alias.name, alias.relation))
@@ -27,8 +38,9 @@ impl SqlParser {
     /// If a qualified reference targets an alias from a correlated outer
     /// query, only that requested outer alias is imported into the inner scope.
     pub fn relation_aliases_at_position(source: &str, position: Position) -> Vec<RelationAlias> {
-        let scoped_source = Self::completion_scope_source(source, position);
-        let mut aliases = Self::extract_relation_alias_entries_from_source(&scoped_source);
+        let scope = Self::completion_scope_analysis(source, position);
+        let mut aliases =
+            Self::extract_relation_alias_entries_in_searchable(&scope.source, &scope.searchable);
         let Some(qualifier) = Self::column_qualifier_before_position(source, position)
             .map(|value| Self::normalize_identifier(&value))
         else {
@@ -50,8 +62,11 @@ impl SqlParser {
         let (_, mut scope_open) = Self::innermost_query_scope_start(&searchable_prefix);
         while let Some(open) = scope_open {
             let outer_position = crate::position::byte_position_at_end(&source[..open]);
-            let outer_scope = Self::completion_scope_source(source, outer_position);
-            let outer_aliases = Self::extract_relation_alias_entries_from_source(&outer_scope);
+            let outer_scope = Self::completion_scope_analysis(source, outer_position);
+            let outer_aliases = Self::extract_relation_alias_entries_in_searchable(
+                &outer_scope.source,
+                &outer_scope.searchable,
+            );
             if let Some(alias) = Self::resolve_relation_alias(&outer_aliases, &qualifier) {
                 aliases.push(alias.clone());
                 break;
@@ -70,18 +85,18 @@ impl SqlParser {
         aliases: &'a [RelationAlias],
         qualifier: &str,
     ) -> Option<&'a RelationAlias> {
-        let qualifier = Self::normalize_identifier(qualifier);
-        if Self::identifier_parts(&qualifier).len() != 1 {
+        let parts = Self::identifier_parts(qualifier);
+        let [qualifier] = parts.as_slice() else {
             return None;
-        }
+        };
 
         aliases
             .iter()
-            .find(|alias| alias.name == qualifier)
+            .find(|alias| alias.name == *qualifier)
             .or_else(|| {
                 aliases.iter().find(|alias| {
                     !Self::is_quoted_identifier_sql(&alias.sql)
-                        && alias.name.eq_ignore_ascii_case(&qualifier)
+                        && alias.name.eq_ignore_ascii_case(qualifier)
                 })
             })
     }
@@ -102,8 +117,15 @@ impl SqlParser {
     }
 
     pub(super) fn extract_relation_alias_entries_from_source(source: &str) -> Vec<RelationAlias> {
-        let mut aliases = HashMap::<String, RelationAlias>::new();
         let searchable_source = Self::mask_sql_noise(source);
+        Self::extract_relation_alias_entries_in_searchable(source, &searchable_source)
+    }
+
+    pub(super) fn extract_relation_alias_entries_in_searchable(
+        source: &str,
+        searchable_source: &str,
+    ) -> Vec<RelationAlias> {
+        let mut aliases = HashMap::<String, RelationAlias>::new();
         let source_upper = searchable_source.to_ascii_uppercase();
 
         // Pattern: FROM/JOIN/UPDATE table_name alias
@@ -122,11 +144,11 @@ impl SqlParser {
                     if let Some((alias, alias_start, alias_end)) =
                         Self::read_relation_alias_with_span_after(
                             source,
-                            &searchable_source,
+                            searchable_source,
                             after_table,
                         )
                     {
-                        let name = Self::normalize_identifier(&alias);
+                        let name = alias;
                         aliases.insert(
                             name.clone(),
                             RelationAlias {
@@ -152,11 +174,11 @@ impl SqlParser {
                 if let Some((alias, alias_start, alias_end)) =
                     Self::read_relation_alias_with_span_after(
                         source,
-                        &searchable_source,
+                        searchable_source,
                         after_table,
                     )
                 {
-                    let name = Self::normalize_identifier(&alias);
+                    let name = alias;
                     aliases.insert(
                         name.clone(),
                         RelationAlias {

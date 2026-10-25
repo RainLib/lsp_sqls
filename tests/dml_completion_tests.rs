@@ -6,6 +6,8 @@ use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Position};
 fn schema(database: &str) -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: database.to_string(),
         server_version: None,
@@ -545,7 +547,8 @@ async fn assert_common_dml_completion(dialect: &dyn Dialect, database: &str) {
     )
     .await;
     assert!(has_label(&where_value, "NULL"));
-    assert!(has_label(&where_value, "TRUE"));
+    assert!(has_label(&where_value, "''"));
+    assert!(!has_label(&where_value, "TRUE"));
     assert!(
         !has_label(&where_value, "DEFAULT"),
         "WHERE value position should not suggest DEFAULT outside assignment values: {where_value:?}"
@@ -583,7 +586,8 @@ async fn assert_common_dml_completion(dialect: &dyn Dialect, database: &str) {
     )
     .await;
     assert!(has_label(&where_in_first_value, "NULL"));
-    assert!(has_label(&where_in_first_value, "TRUE"));
+    assert!(has_label(&where_in_first_value, "''"));
+    assert!(!has_label(&where_in_first_value, "TRUE"));
     assert!(
         !has_label(&where_in_first_value, "owner"),
         "IN list first value should not return fields: {where_in_first_value:?}"
@@ -600,7 +604,8 @@ async fn assert_common_dml_completion(dialect: &dyn Dialect, database: &str) {
     )
     .await;
     assert!(has_label(&where_in_next_value, "NULL"));
-    assert!(has_label(&where_in_next_value, "TRUE"));
+    assert!(has_label(&where_in_next_value, "''"));
+    assert!(!has_label(&where_in_next_value, "TRUE"));
     assert!(
         !has_label(&where_in_next_value, "owner"),
         "IN list next value should not return fields: {where_in_next_value:?}"
@@ -696,7 +701,8 @@ async fn assert_common_dml_completion(dialect: &dyn Dialect, database: &str) {
 
     let case_when_value = complete(dialect, "SELECT CASE WHEN owner = ", &schema).await;
     assert!(has_label(&case_when_value, "NULL"));
-    assert!(has_label(&case_when_value, "TRUE"));
+    assert!(has_label(&case_when_value, "''"));
+    assert!(!has_label(&case_when_value, "TRUE"));
     assert!(
         !has_label(&case_when_value, "owner"),
         "CASE WHEN right-hand value should not return fields: {case_when_value:?}"

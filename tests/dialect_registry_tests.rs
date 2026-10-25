@@ -85,3 +85,16 @@ fn test_reviewed_vendor_compatibility_aliases_keep_their_parser_baseline() {
         );
     }
 }
+
+#[test]
+fn sqlserver_profiles_are_separate_from_postgres_and_keep_aliases() {
+    let registry = DialectRegistry::new();
+    let sqlserver = registry.get_by_name("sqlserver").unwrap();
+    assert_eq!(sqlserver.name(), "sqlserver");
+    assert_eq!(registry.get_by_name("mssql").unwrap().name(), "sqlserver");
+    assert_eq!(registry.get_by_name("tsql").unwrap().name(), "sqlserver");
+    assert!(!std::sync::Arc::ptr_eq(
+        &sqlserver,
+        &registry.get_by_name("postgres").unwrap()
+    ));
+}

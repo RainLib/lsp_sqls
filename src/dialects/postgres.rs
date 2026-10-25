@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use tower_lsp::lsp_types::{CompletionItem, Diagnostic, Hover, Location, Position};
 
 pub struct PostgresDialect {
+    pub(super) identity: &'static str,
     pub(super) parser: std::sync::Mutex<SqlParser>,
 }
 
@@ -22,14 +23,19 @@ mod hover;
 #[async_trait]
 impl Dialect for PostgresDialect {
     fn name(&self) -> &str {
-        "postgres"
+        self.identity
     }
 
-    async fn parse(&self, sql: &str, _schema: Option<&Schema>) -> Vec<Diagnostic> {
-        // 使用 Tree-sitter 进行容错 SQL 解析
-        let mut parser = self.parser.lock().unwrap();
-        let parse_result = parser.parse(sql);
-        parse_result.diagnostics
+    async fn parse(&self, sql: &str, schema: Option<&Schema>) -> Vec<Diagnostic> {
+        self.parse_with_syntax(sql, schema).await.diagnostics
+    }
+
+    async fn parse_with_syntax(
+        &self,
+        sql: &str,
+        _schema: Option<&Schema>,
+    ) -> crate::parser::ParseResult {
+        common::validate_join_profile(self.parser.lock().unwrap().parse(sql), self.name())
     }
 
     async fn completion(
@@ -38,6 +44,16 @@ impl Dialect for PostgresDialect {
         position: Position,
         schema: Option<&Schema>,
     ) -> Vec<CompletionItem> {
+        completion::completion(self, sql, position, schema).items
+    }
+
+    async fn completion_with_scope(
+        &self,
+        sql: &str,
+        position: Position,
+        schema: Option<&Schema>,
+        _context: Option<&tower_lsp::lsp_types::CompletionContext>,
+    ) -> crate::dialect::CompletionSnapshot {
         completion::completion(self, sql, position, schema)
     }
 
@@ -78,7 +94,8 @@ impl Dialect for PostgresDialect {
 
                 if is_table {
                     if let Some(schema) = schema {
-                        let table_ref = SqlParser::normalize_identifier(&node_text);
+                        let relation = crate::dialects::common::relation_reference_node(node);
+                        let table_ref = parser.node_text(relation, sql);
                         if let Some(table) = Self::find_table_by_reference(schema, &table_ref) {
                             return common::metadata_location(
                                 table.source_location.as_ref(),

@@ -7,16 +7,31 @@ use tower_lsp::lsp_types::{CompletionItem, Position};
 
 impl PostgresDialect {
     pub fn new() -> Self {
+        Self::with_profile("postgres", SqlPlaceholderDialect::Postgres)
+    }
+
+    pub(crate) fn sqlserver() -> Self {
+        Self::with_profile("sqlserver", SqlPlaceholderDialect::SqlServer)
+    }
+
+    fn with_profile(identity: &'static str, profile: SqlPlaceholderDialect) -> Self {
         Self {
-            parser: std::sync::Mutex::new(SqlParser::new_with_placeholder_dialect(
-                SqlPlaceholderDialect::Postgres,
-            )),
+            identity,
+            parser: std::sync::Mutex::new(SqlParser::new_with_placeholder_dialect(profile)),
+        }
+    }
+
+    pub(super) fn display_name(&self) -> &'static str {
+        if self.identity == "sqlserver" {
+            "SQL Server"
+        } else {
+            "PostgreSQL"
         }
     }
 
     /// 创建关键字补全项
     pub(super) fn create_keyword_item(&self, keyword: &str) -> CompletionItem {
-        common::create_keyword_item("PostgreSQL", keyword)
+        common::create_keyword_item(self.display_name(), keyword)
     }
 
     /// 创建列补全项
@@ -85,8 +100,9 @@ impl PostgresDialect {
         tree: &tree_sitter::Tree,
         sql: &str,
         position: Position,
+        schema: &Schema,
     ) -> Vec<String> {
-        common::referenced_table_names_at_position(parser, tree, sql, position)
+        common::referenced_table_names_at_position(parser, tree, sql, position, schema)
     }
 
     pub(super) fn add_schema_columns(

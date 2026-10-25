@@ -61,6 +61,8 @@ async fn test_comprehensive_completion_scenarios() {
     // Shared Schema for tests
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "shop".to_string(),
         server_version: None,
@@ -374,18 +376,33 @@ async fn test_comprehensive_completion_scenarios() {
     )
     .await;
 
-    // 子查询中应该只显示当前子查询表的列名，不应混入外层 users。
+    // 当前查询字段优先；合法的外层相关字段带来源限定，避免混成内层字段。
     assert!(
         items7
             .iter()
             .any(|item| item.label.contains("order_id") || item.label.contains("status")),
         "Subquery should suggest column names"
     );
+    let outer_email = items7
+        .iter()
+        .find(|item| item.label == "users.email")
+        .expect("correlated outer users.email candidate");
+    assert_eq!(outer_email.insert_text.as_deref(), Some("users.email"));
     assert!(
-        !items7
-            .iter()
-            .any(|item| item.label.contains("users.") || item.label == "email"),
-        "Subquery WHERE should not suggest outer users columns"
+        !items7.iter().any(|item| item.label == "email"),
+        "Outer fields must retain their source qualifier"
+    );
+    let inner_position = items7
+        .iter()
+        .position(|item| item.label == "order_id")
+        .unwrap();
+    let outer_position = items7
+        .iter()
+        .position(|item| item.label == "users.email")
+        .unwrap();
+    assert!(
+        inner_position < outer_position,
+        "Inner fields must rank ahead of outer correlation"
     );
 
     println!("\n=== Test 7b: CTE main query scope ===");

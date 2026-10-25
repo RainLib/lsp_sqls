@@ -107,6 +107,14 @@ pub(super) fn schema_id_for_file(
         }
     }
 
+    if let Some(schema_id) = super::auxiliary_documents::configured_source_uri(uri)
+        .and_then(|source| configured_file_schemas.get(&source).map(|value| *value))
+    {
+        if schema_manager.get(schema_id).is_some() {
+            return Some(schema_id);
+        }
+    }
+
     if let Some(schema_id) = inferred_file_schemas
         .get(uri)
         .map(|schema_id| *schema_id.value())
@@ -128,40 +136,45 @@ pub(super) fn schema_qualifier_at_position(text: &str, position: Position) -> Op
 }
 
 pub(super) fn schema_table_matches(schema: &Schema, reference: &str, table: &Table) -> bool {
-    SqlParser::table_name_matches_with_catalog(
-        reference,
-        schema.catalog.as_deref(),
-        &schema.database,
-        &table.name,
-    )
+    (schema.server.is_none() || SqlParser::identifier_parts(reference).len() == 4)
+        && crate::relation_bindings::table_matches(schema, table, reference)
 }
 
 pub(super) fn find_schema_by_qualifier(
     schema_manager: &SchemaManager,
     qualifier: &str,
 ) -> Option<Schema> {
-    let normalized_qualifier = SqlParser::normalize_identifier(qualifier);
-    if normalized_qualifier.is_empty() {
-        return None;
-    }
-
-    let qualifier_has_catalog = normalized_qualifier.contains('.');
+    let parts = SqlParser::identifier_parts(qualifier);
     let mut matched_schema = None;
     for schema_id in schema_manager.list_ids() {
         let Some(schema) = schema_manager.get(schema_id) else {
             continue;
         };
-        let normalized_database = SqlParser::normalize_identifier(&schema.database);
-        let normalized_namespace = schema
-            .catalog
-            .as_deref()
-            .map(SqlParser::normalize_identifier)
-            .filter(|catalog| !catalog.is_empty())
-            .map(|catalog| format!("{catalog}.{normalized_database}"))
-            .unwrap_or_else(|| normalized_database.clone());
-        let is_match = normalized_namespace.eq_ignore_ascii_case(&normalized_qualifier)
-            || (!qualifier_has_catalog
-                && normalized_database.eq_ignore_ascii_case(&normalized_qualifier));
+        let is_match = match parts.as_slice() {
+            [database] => {
+                schema.server.is_none() && database.eq_ignore_ascii_case(&schema.database)
+            }
+            [catalog, database] => {
+                schema.server.is_none()
+                    && database.eq_ignore_ascii_case(&schema.database)
+                    && schema
+                        .catalog
+                        .as_ref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(catalog))
+            }
+            [server, catalog, database] => {
+                schema
+                    .server
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(server))
+                    && schema
+                        .catalog
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(catalog))
+                    && schema.database.eq_ignore_ascii_case(database)
+            }
+            _ => false,
+        };
         if !is_match {
             continue;
         }
@@ -178,6 +191,12 @@ pub(super) fn find_schema_by_table_reference(
     schema_manager: &SchemaManager,
     table_reference: &str,
 ) -> Option<Schema> {
+    if SqlParser::identifier_parts(table_reference)
+        .iter()
+        .any(String::is_empty)
+    {
+        return schema_manager.resolve_omitted_schema(table_reference);
+    }
     let mut matched_schema: Option<Schema> = None;
 
     for schema_id in schema_manager.list_ids() {

@@ -1,0 +1,547 @@
+--- a/grammar.js
++++ b/grammar.js
+@@ -1,5 +1,6 @@
+ module.exports = grammar({
+   name: 'sql',
++  inline: $ => [$._join_type, $._join_tail],
+ 
+   extras: $ => [
+     /\s\n/,
+@@ -16,15 +17,21 @@ module.exports = grammar({
+   ],
+ 
+   conflicts: $ => [
++    [$.lateral_view],
+     [$.object_reference, $._qualified_field],
+     [$.object_reference],
+     [$.between_expression, $.binary_expression],
+     [$.time],
+     [$.timestamp],
++    [$.tsql_declaration, $.function_declaration],
++    [$._tsql_module_prefix, $.create_function],
++    [$.execute_statement],
+   ],
+ 
+   precedences: $ => [
+     [
++      'type_array',
++      'type_cast',
+       'binary_is',
+       'unary_not',
+       'binary_exp',
+@@ -48,21 +55,29 @@ module.exports = grammar({
+     program: $ => seq(
+       // any number of transactions, statements, or blocks with a terminating ;
+       repeat(
+-        seq(
+-          choice(
+-            $.transaction,
+-            $.statement,
+-            $.block,
+-          ),
+-          ';',
++        choice(
++          seq(choice($.transaction, $.statement, $.block), ';'),
++          seq($.tsql_procedure_definition, $.tsql_batch_separator),
++          seq($.tsql_function_definition, optional(';'), $.tsql_batch_separator),
++          $.tsql_batch_separator,
+         ),
+       ),
+       // optionally, a single statement without a terminating ;
+       optional(
+-        $.statement,
++        choice($.statement, $.tsql_procedure_definition, seq($.tsql_function_definition, optional(';'))),
+       ),
+     ),
+ 
++    keyword_call: _ => make_keyword("call"),
++    keyword_proc: _ => make_keyword("proc"),
++    keyword_go: _ => make_keyword("go"),
++    keyword_while: _ => make_keyword("while"),
++    keyword_readonly: _ => make_keyword("readonly"),
++    keyword_nocount: _ => make_keyword("nocount"),
++    keyword_encryption: _ => make_keyword("encryption"),
++    keyword_schemabinding: _ => make_keyword("schemabinding"),
++    keyword_caller: _ => make_keyword("caller"),
++    keyword_self: _ => make_keyword("self"),
+     keyword_select: _ => make_keyword("select"),
+     keyword_delete: _ => make_keyword("delete"),
+     keyword_insert: _ => make_keyword("insert"),
+@@ -96,6 +111,7 @@ module.exports = grammar({
+     keyword_partition: _ => make_keyword("partition"),
+     keyword_by: _ => make_keyword("by"),
+     keyword_having: _ => make_keyword("having"),
++    keyword_qualify: _ => make_keyword("qualify"),
+     keyword_desc: _ => make_keyword("desc"),
+     keyword_asc: _ => make_keyword("asc"),
+     keyword_limit: _ => make_keyword("limit"),
+@@ -226,6 +242,9 @@ module.exports = grammar({
+     keyword_gin:  _ => make_keyword("gin"),
+     keyword_brin: _ => make_keyword("brin"),
+     keyword_like: _ => choice(make_keyword("like"),make_keyword("ilike")),
++    keyword_regexp: _ => make_keyword("regexp"),
++    keyword_rlike: _ => make_keyword("rlike"),
++    keyword_glob: _ => make_keyword("glob"),
+     keyword_similar: _ => make_keyword("similar"),
+     keyword_unsigned: _ => make_keyword("unsigned"),
+     keyword_zerofill: _ => make_keyword("zerofill"),
+@@ -273,6 +292,7 @@ module.exports = grammar({
+     keyword_setof: _ => make_keyword("setof"),
+     keyword_atomic: _ => make_keyword("atomic"),
+     keyword_declare: _ => make_keyword("declare"),
++    keyword_max: _ => make_keyword("max"),
+     keyword_language: _ => make_keyword("language"),
+     keyword_immutable: _ => make_keyword("immutable"),
+     keyword_stable: _ => make_keyword("stable"),
+@@ -326,6 +346,9 @@ module.exports = grammar({
+     keyword_referencing: _ => make_keyword("referencing"),
+     keyword_statement: _ => make_keyword("statement"),
+     keyword_execute: _ => make_keyword("execute"),
++    keyword_exec: _ => make_keyword("exec"),
++    keyword_output: _ => make_keyword("output"),
++    keyword_recompile: _ => make_keyword("recompile"),
+     keyword_procedure: _ => make_keyword("procedure"),
+     keyword_object_id: _ => make_keyword("object_id"),
+ 
+@@ -373,6 +396,9 @@ module.exports = grammar({
+     // Operators
+     is_not: $ => prec.left(seq($.keyword_is, $.keyword_not)),
+     not_like: $ => seq($.keyword_not, $.keyword_like),
++    not_regexp: $ => seq($.keyword_not, $.keyword_regexp),
++    not_rlike: $ => seq($.keyword_not, $.keyword_rlike),
++    not_glob: $ => seq($.keyword_not, $.keyword_glob),
+     similar_to: $ => seq($.keyword_similar, $.keyword_to),
+     not_similar_to: $ => seq($.keyword_not, $.keyword_similar, $.keyword_to),
+     distinct_from: $ => seq($.keyword_is, $.keyword_distinct, $.keyword_from),
+@@ -471,7 +497,7 @@ module.exports = grammar({
+ 
+     keyword_array: _ => make_keyword("array"), // not included in _type since it's a constructor literal
+ 
+-    _type: $ => prec.left(
++    _type: $ => prec.right('type_array',
+       seq(
+         choice(
+           $.keyword_boolean,
+@@ -518,7 +544,7 @@ module.exports = grammar({
+ 
+           $.keyword_date,
+           $.keyword_datetime,
+-          $.keyword_datetime2,
++          $.datetime2,
+           $.datetimeoffset,
+           $.keyword_smalldatetime,
+           $.time,
+@@ -538,13 +564,29 @@ module.exports = grammar({
+           $.keyword_regproc,
+           $.keyword_regtype,
+ 
+-          field("custom_type", $.object_reference)
++          seq(
++            field("custom_type", $.object_reference),
++            optional(seq(
++              '(',
++              choice(
++                seq(
++                  field('size', alias($._natural_number, $.literal)),
++                  optional(seq(',', field('scale', alias($._natural_number, $.literal)))),
++                ),
++                seq(
++                  field('type_parameter', $._type),
++                  repeat(seq(',', field('type_parameter', $._type))),
++                ),
++              ),
++              ')',
++            )),
++          )
+         ),
+         optional($.array_size_definition)
+       ),
+     ),
+ 
+-    array_size_definition: $ => prec.left(
++    array_size_definition: $ => prec.right('type_array',
+       choice(
+         seq($.keyword_array, optional($._array_size_definition)),
+         repeat1($._array_size_definition),
+@@ -606,6 +648,7 @@ module.exports = grammar({
+       $.keyword_time,
+       $.keyword_zone,
+     ),
++    datetime2: $ => parametric_type($, $.keyword_datetime2),
+     datetimeoffset: $ => parametric_type($, $.keyword_datetimeoffset),
+     time: $ => seq(
+       parametric_type($, $.keyword_time),
+@@ -622,20 +665,16 @@ module.exports = grammar({
+       paren_list(field("value", alias($._literal_string, $.literal)), true)
+     ),
+ 
+-    array: $ => seq(
+-      $.keyword_array,
+-      choice(
+-        seq(
+-          "[",
+-          comma_list($._expression),
+-          "]"
++    array: $ => choice(
++      seq(
++        $.keyword_array,
++        choice(
++          seq("[", comma_list($._expression), "]"),
++          wrapped_in_parenthesis($._dml_read),
++          paren_list($._expression),
+         ),
+-        seq(
+-          "(",
+-          $._dml_read,
+-          ")",
+-        )
+-      )
++      ),
++      seq("[", comma_list($._expression), "]"),
+     ),
+ 
+     comment: _ => /--.*/,
+@@ -693,12 +732,119 @@ module.exports = grammar({
+         optional($.keyword_verbose),
+       )),
+       choice(
++        $.call_statement,
++        $.execute_statement,
++        $.tsql_declare_statement,
+         $._ddl_statement,
+         $._dml_write,
+         optional_parenthesis($._dml_read),
+       ),
+     ),
+ 
++    call_statement: $ => seq($.keyword_call, $.invocation),
++
++    // Static T-SQL module calls deliberately retain their own argument nodes.
++    // Expressions/invocations are not general EXEC values; dynamic string EXEC
++    // and linked-server/result-set options are separate syntax contracts.
++    execute_statement: $ => seq(
++      choice($.keyword_exec, $.keyword_execute),
++      optional(seq(field('return_status', $.identifier), '=')),
++      field('module', $.object_reference),
++      optional(comma_list($.execute_argument)),
++      optional(seq($.keyword_with, $.keyword_recompile)),
++    ),
++
++    execute_argument: $ => seq(
++      optional(seq(field('name', $.identifier), '=')),
++      field('value', choice($.literal, $.identifier, $.keyword_default)),
++      optional(choice($.keyword_out, $.keyword_output)),
++    ),
++
++    tsql_declare_statement: $ => seq($.keyword_declare, comma_list($.tsql_declaration)),
++
++    tsql_declaration: $ => seq(
++      field('name', $.identifier),
++      optional($.keyword_as),
++      field('type', choice($._type, $.tsql_max_type)),
++      optional(seq('=', field('value', $._expression))),
++    ),
++
++    tsql_max_type: $ => seq(
++      choice($.keyword_varchar, $.keyword_nvarchar, $.keyword_varbinary),
++      '(', $.keyword_max, ')',
++    ),
++
++    _tsql_module_prefix: $ => choice(
++      seq($.keyword_create, optional(seq($.keyword_or, $.keyword_alter))),
++      $.keyword_alter,
++    ),
++
++    tsql_batch_separator: $ => seq($.keyword_go, optional(alias($._natural_number, $.literal))),
++
++    _tsql_parameter_definition: $ => seq(
++      field('name', $.identifier), optional($.keyword_as),
++      field('type', choice($._type, $.tsql_max_type)),
++      optional($.keyword_null),
++      optional(seq('=', field('default', $.literal))),
++      optional($.keyword_readonly),
++    ),
++
++    tsql_procedure_parameter: $ => seq(
++      $._tsql_parameter_definition, optional(choice($.keyword_out, $.keyword_output)),
++    ),
++    tsql_function_parameter: $ => $._tsql_parameter_definition,
++
++    tsql_module_options: $ => seq($.keyword_with, comma_list(choice(
++      $.keyword_recompile, $.keyword_encryption, $.keyword_schemabinding,
++      seq($.keyword_execute, $.keyword_as, choice($.keyword_caller, $.keyword_self, $.keyword_owner, $.literal)),
++    ))),
++
++    tsql_procedure_definition: $ => prec.right(seq(
++      $._tsql_module_prefix, choice($.keyword_proc, $.keyword_procedure),
++      field('name', $.object_reference), optional(comma_list($.tsql_procedure_parameter)),
++      optional($.tsql_module_options), $.keyword_as,
++      field('body', $.tsql_procedure_body),
++    )),
++
++    tsql_procedure_body: $ => prec.right(repeat1(seq($._tsql_body_statement, optional(';')))),
++
++    tsql_function_definition: $ => seq(
++      $._tsql_module_prefix, $.keyword_function, field('name', $.object_reference),
++      '(', optional(comma_list($.tsql_function_parameter)), ')', $.keyword_returns,
++      choice(
++        seq(field('return_type', choice($._type, $.tsql_max_type)), optional($.tsql_module_options), optional($.keyword_as), field('body', $.tsql_scalar_function_body)),
++        seq($.keyword_table, optional($.tsql_module_options), optional($.keyword_as), $.keyword_return, field('body', optional_parenthesis($._dml_read))),
++      ),
++    ),
++
++    tsql_scalar_function_body: $ => seq(
++      $.keyword_begin, repeat(seq($._tsql_body_statement, optional(';'))),
++      $.keyword_return, field('value', $._expression), optional(';'), $.keyword_end,
++    ),
++
++    tsql_module_block: $ => seq(
++      $.keyword_begin, repeat(seq($._tsql_body_statement, optional(';'))), $.keyword_end,
++    ),
++
++    _tsql_body_statement: $ => choice(
++      alias($._tsql_query_statement, $.statement), $.tsql_module_block, $.tsql_return_statement,
++      $.tsql_set_statement, $.tsql_if_statement, $.tsql_while_statement,
++    ),
++    _tsql_query_statement: $ => choice(
++      $.execute_statement, $.tsql_declare_statement, $._dml_read, $._dml_write,
++      $.create_table, $.alter_table, $.drop_table,
++    ),
++    tsql_return_statement: $ => prec.right(seq($.keyword_return, optional($._expression))),
++    tsql_set_statement: $ => seq($.keyword_set, choice(
++      seq(field('name', $.identifier), '=', field('value', $._expression)),
++      seq($.keyword_nocount, choice($.keyword_on, $.keyword_off)),
++    )),
++    tsql_if_statement: $ => prec.right(seq(
++      $.keyword_if, field('condition', $._expression), field('consequence', $._tsql_body_statement),
++      optional(';'), optional(seq($.keyword_else, field('alternative', $._tsql_body_statement))),
++    )),
++    tsql_while_statement: $ => seq($.keyword_while, field('condition', $._expression), field('body', $._tsql_body_statement)),
++
+     _ddl_statement: $ => choice(
+       $._create_statement,
+       $._alter_statement,
+@@ -808,8 +954,13 @@ module.exports = grammar({
+       ),
+     ),
+ 
+-    set_operation: $ => seq(
++    _set_operand: $ => choice(
+       $._select_statement,
++      wrapped_in_parenthesis($.set_operation),
++    ),
++
++    set_operation: $ => seq(
++      $._set_operand,
+       repeat1(
+         seq(
+           field(
+@@ -820,7 +971,7 @@ module.exports = grammar({
+               $.keyword_intersect,
+             ),
+           ),
+-          $._select_statement,
++          $._set_operand,
+         ),
+       ),
+     ),
+@@ -835,6 +986,12 @@ module.exports = grammar({
+           ),
+         ),
+         optional($.from),
++        optional($.where),
++        optional($.group_by),
++        optional($.window_clause),
++        optional($.qualify),
++        optional($.order_by),
++        optional($.limit),
+       ),
+     ),
+ 
+@@ -2945,11 +3102,11 @@ module.exports = grammar({
+       field('name', $.identifier),
+     ),
+ 
+-    implicit_cast: $ => seq(
++    implicit_cast: $ => prec.left('type_cast', seq(
+       $._expression,
+       '::',
+       $._type,
+-    ),
++    )),
+ 
+     // Postgres syntax for intervals
+     interval: $ => seq(
+@@ -2973,6 +3130,12 @@ module.exports = grammar({
+       wrapped_in_parenthesis($.where),
+     ),
+ 
++    named_argument: $ => seq(
++      field('name', $.identifier),
++      field('operator', choice('=>', ':=')),
++      field('value', $.term),
++    ),
++
+     invocation: $ => prec(1,
+       seq(
+         $.object_reference,
+@@ -2981,9 +3144,10 @@ module.exports = grammar({
+           paren_list(
+             seq(
+               optional($.keyword_distinct),
++              optional($.keyword_variadic),
+               field(
+                 'parameter',
+-                $.term,
++                choice($.term, $.named_argument),
+               ),
+               optional($.order_by)
+             )
+@@ -3129,43 +3293,37 @@ module.exports = grammar({
+ 
+     from: $ => seq(
+       $.keyword_from,
+-      optional(
+-        $.keyword_only,
+-      ),
+-      comma_list($.relation, true),
+-      optional($.index_hint),
+-      repeat(
+-        choice(
+-          $.join,
+-          $.cross_join,
+-          $.lateral_join,
+-          $.lateral_cross_join,
+-        ),
+-      ),
+-      optional($.where),
+-      optional($.group_by),
+-      optional($.window_clause),
+-      optional($.order_by),
+-      optional($.limit),
++      optional($.keyword_only),
++      comma_list(seq($.relation, optional($.index_hint), repeat($._join_tail)), true),
++    ),
++
++    _join_tail: $ => choice($.join, $.cross_join, $.lateral_join, $.lateral_cross_join),
++
++    parenthesized_join: $ => wrapped_in_parenthesis(
++      seq($.relation, repeat($._join_tail)),
+     ),
+ 
+     relation: $ => prec.right(
+       seq(
+-        choice(
+-          $.subquery,
+-          $.invocation,
+-          $.object_reference,
+-          wrapped_in_parenthesis($.values),
+-        ),
+-        optional(
+-          seq(
+-            $._alias,
+-            optional(alias($._column_list, $.list)),
+-          ),
+-        ),
++        choice($.subquery, $.invocation, $.object_reference, $.parenthesized_join, wrapped_in_parenthesis($.values)),
++        optional(seq($._alias, optional(alias($._column_list, $.list)))),
++        repeat($.lateral_view),
+       ),
+     ),
+ 
++    lateral_view: $ => seq(
++      $.keyword_lateral,
++      $.keyword_view,
++      optional($.keyword_outer),
++      field('function', $.invocation),
++      field('alias', $.identifier),
++      optional(seq(
++        $.keyword_as,
++        field('column', $.identifier),
++        repeat(seq(',', field('column', $.identifier))),
++      )),
++    ),
++
+     values: $ => seq(
+       $.keyword_values,
+       $.list,
+@@ -3197,33 +3355,21 @@ module.exports = grammar({
+       ),
+     ),
+ 
+-    join: $ => seq(
+-      optional($.keyword_natural),
+-      optional(
++    _join_type: $ => choice(
++      $.keyword_left, seq($.keyword_full, $.keyword_outer),
++      seq($.keyword_left, $.keyword_outer), $.keyword_right,
++      seq($.keyword_right, $.keyword_outer), $.keyword_inner, $.keyword_full,
++    ),
++
++    join: $ => choice(
++      seq($.keyword_natural, optional($._join_type), $.keyword_join, $.relation, optional($.index_hint)),
++      seq(
++        optional($._join_type), $.keyword_join, $.relation, optional($.index_hint), optional($.join),
+         choice(
+-          $.keyword_left,
+-          seq($.keyword_full, $.keyword_outer),
+-          seq($.keyword_left, $.keyword_outer),
+-          $.keyword_right,
+-          seq($.keyword_right, $.keyword_outer),
+-          $.keyword_inner,
+-          $.keyword_full,
++          seq($.keyword_on, field('predicate', $._expression)),
++          seq($.keyword_using, alias($._column_list, $.list)),
+         ),
+       ),
+-      $.keyword_join,
+-      $.relation,
+-      optional($.index_hint),
+-      optional($.join),
+-      choice(
+-        seq(
+-          $.keyword_on,
+-          field("predicate", $._expression),
+-        ),
+-        seq(
+-          $.keyword_using,
+-          alias($._column_list, $.list),
+-        )
+-      )
+     ),
+ 
+     cross_join: $ => prec.right(
+@@ -3315,6 +3461,11 @@ module.exports = grammar({
+       $._expression,
+     ),
+ 
++    qualify: $ => seq(
++      $.keyword_qualify,
++      field('predicate', $._expression),
++    ),
++
+     order_by: $ => prec.right(seq(
+       $.keyword_order,
+       $.keyword_by,
+@@ -3469,6 +3620,7 @@ module.exports = grammar({
+         ['>=', 'binary_relation'],
+         ['>', 'binary_relation'],
+         ['<>', 'binary_relation'],
++        ['<=>', 'binary_relation'],
+         [$.op_other, 'binary_other'],
+         [$.keyword_is, 'binary_is'],
+         [$.is_not, 'binary_is'],
+@@ -3476,6 +3628,13 @@ module.exports = grammar({
+         [$.not_like, 'pattern_matching'],
+         [$.similar_to, 'pattern_matching'],
+         [$.not_similar_to, 'pattern_matching'],
++        [$.keyword_escape, 'binary_in'],
++        [$.keyword_regexp, 'pattern_matching'],
++        [$.not_regexp, 'pattern_matching'],
++        [$.keyword_rlike, 'pattern_matching'],
++        [$.not_rlike, 'pattern_matching'],
++        [$.keyword_glob, 'pattern_matching'],
++        [$.not_glob, 'pattern_matching'],
+         // binary_is precedence disambiguates `(is not distinct from)` from an
+         // `is (not distinct from)` with a unary `not`
+         [$.distinct_from, 'binary_is'],

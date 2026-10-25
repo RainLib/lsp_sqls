@@ -13,6 +13,10 @@ impl SqlParser {
             ),
             ("ON", Self::previous_keyword_position(statement_upper, "ON")),
             (
+                "QUALIFY",
+                Self::previous_keyword_position(statement_upper, "QUALIFY"),
+            ),
+            (
                 "WHEN",
                 Self::previous_keyword_position(statement_upper, "WHEN"),
             ),
@@ -41,11 +45,24 @@ impl SqlParser {
                 "GROUP BY",
                 "ORDER BY",
                 "HAVING",
+                "WINDOW",
+                "QUALIFY",
                 "LIMIT",
                 "RETURNING",
                 "UNION",
             ][..],
             "HAVING" => &["ORDER BY", "LIMIT", "UNION"][..],
+            "QUALIFY" => &[
+                "ORDER BY",
+                "LIMIT",
+                "OFFSET",
+                "FETCH",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "SETTINGS",
+                "FORMAT",
+            ][..],
             "WHEN" => &["THEN", "ELSE", "END"][..],
             _ => &[][..],
         };
@@ -222,7 +239,13 @@ impl SqlParser {
         let segment = &statement_upper[after_clause..];
         let raw_segment = raw_statement_upper.get(after_clause..).unwrap_or(segment);
         let trimmed = segment.trim_end();
-        if trimmed.is_empty() || trimmed.ends_with('.') {
+        if trimmed.is_empty()
+            || trimmed.ends_with('.')
+            || trimmed.ends_with('(')
+            || Self::statement_words(trimmed)
+                .last()
+                .is_some_and(|word| matches!(*word, "AND" | "OR" | "NOT"))
+        {
             return false;
         }
 
@@ -319,40 +342,44 @@ impl SqlParser {
     }
 
     pub(super) fn is_predicate_continuation_prefix(prefix: &str, clause: &str) -> bool {
-        matches!(
-            prefix,
-            "A" | "AN" | "AND" | "O" | "OR" | "L" | "LI" | "LIM" | "LIMI" | "LIMIT"
-        ) || matches!(
-            (clause, prefix),
-            (
-                "WHERE" | "ON",
-                "G" | "GR"
-                    | "GRO"
-                    | "GROU"
-                    | "GROUP"
-                    | "H"
-                    | "HA"
-                    | "HAV"
-                    | "HAVI"
-                    | "HAVIN"
-                    | "HAVING"
-                    | "ORD"
-                    | "ORDE"
-                    | "ORDER"
-            ) | ("HAVING", "ORD" | "ORDE" | "ORDER")
-                | ("WHEN", "T" | "TH" | "THE" | "THEN")
-                | ("ON" | "SET", "W" | "WH" | "WHE" | "WHER" | "WHERE")
-                | (
-                    "SET",
-                    "R" | "RE"
-                        | "RET"
-                        | "RETU"
-                        | "RETUR"
-                        | "RETURN"
-                        | "RETURNI"
-                        | "RETURNIN"
-                        | "RETURNING"
-                )
-        )
+        (matches!(clause, "WHERE" | "ON" | "HAVING")
+            && "QUALIFY".starts_with(prefix)
+            && !prefix.is_empty())
+            || matches!(
+                prefix,
+                "A" | "AN" | "AND" | "O" | "OR" | "L" | "LI" | "LIM" | "LIMI" | "LIMIT"
+            )
+            || matches!(
+                (clause, prefix),
+                (
+                    "WHERE" | "ON",
+                    "G" | "GR"
+                        | "GRO"
+                        | "GROU"
+                        | "GROUP"
+                        | "H"
+                        | "HA"
+                        | "HAV"
+                        | "HAVI"
+                        | "HAVIN"
+                        | "HAVING"
+                        | "ORD"
+                        | "ORDE"
+                        | "ORDER"
+                ) | ("HAVING", "ORD" | "ORDE" | "ORDER")
+                    | ("WHEN", "T" | "TH" | "THE" | "THEN")
+                    | ("ON" | "SET", "W" | "WH" | "WHE" | "WHER" | "WHERE")
+                    | (
+                        "SET",
+                        "R" | "RE"
+                            | "RET"
+                            | "RETU"
+                            | "RETUR"
+                            | "RETURN"
+                            | "RETURNI"
+                            | "RETURNIN"
+                            | "RETURNING"
+                    )
+            )
     }
 }

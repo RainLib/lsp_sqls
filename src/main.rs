@@ -26,6 +26,30 @@ async fn main() {
 
     let (service, socket) = LspService::build(SqlLspServer::new)
         .custom_method(
+            "oxide/completionSnapshot",
+            SqlLspServer::completion_snapshot,
+        )
+        .custom_method(
+            "oxide/analysisConfiguration",
+            SqlLspServer::analysis_configuration,
+        )
+        .custom_method(
+            "oxide/documentDiagnostics",
+            SqlLspServer::document_diagnostic_snapshot,
+        )
+        .custom_method(
+            "oxide/documentStructure",
+            SqlLspServer::document_structure_snapshot,
+        )
+        .custom_method(
+            "oxide/documentSemantics",
+            SqlLspServer::document_semantic_snapshot,
+        )
+        .custom_method(
+            "oxide/documentCompletions",
+            SqlLspServer::document_completion_snapshot,
+        )
+        .custom_method(
             "oxide/inlineCompletionContext",
             SqlLspServer::inline_completion_context,
         )

@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn partial_member_prefix_keeps_context_without_stealing_relations_or_numbers() {
+    for sql in [
+        "SELECT u.na",
+        "SELECT u.na FROM users u",
+        "SELECT SUM(u.am",
+        "SELECT * FROM users u WHERE u.na",
+        "SELECT \"客户\".名",
+    ] {
+        let offset = sql
+            .find(" FROM")
+            .filter(|_| sql.starts_with("SELECT u.na FROM"))
+            .unwrap_or(sql.len());
+        let position = position_at_end(&sql[..offset]);
+        let mut parser = SqlParser::new();
+        let tree = parser.parse_syntax_tree(sql).unwrap();
+        let node = parser.get_node_at_position(&tree, position).unwrap();
+        assert_eq!(
+            parser.analyze_completion_context(node, sql, position),
+            CompletionContext::TableColumn,
+            "{sql}"
+        );
+        assert_eq!(
+            SqlParser::completion_context_from_text(sql, position),
+            CompletionContext::TableColumn,
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        analyzed_context_at_end("SELECT * FROM public.us"),
+        CompletionContext::FromClause
+    );
+    for sql in [
+        "SELECT 1.23",
+        "SELECT 'u.na",
+        "SELECT 1 -- u.na",
+        "SELECT 1 /* u.na",
+    ] {
+        assert_ne!(
+            analyzed_context_at_end(sql),
+            CompletionContext::TableColumn,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn completion_context_ignores_keywords_inside_comments_and_literals() {
     let parser = SqlParser::new();
 
@@ -371,4 +417,65 @@ fn fallback_completion_context_uses_latest_grouping_clause() {
         ),
         CompletionContext::OrderDirectionClause
     );
+}
+
+#[test]
+fn text_fallback_distinguishes_searched_case_join_and_ddl_condition_sites() {
+    for (sql, expected) in [
+        ("SELECT CASE WHEN ", CompletionContext::WhereClause),
+        (
+            "SELECT CASE u.id WHEN ",
+            CompletionContext::CaseResultClause,
+        ),
+        (
+            "SELECT * FROM users u JOIN orders o ON ",
+            CompletionContext::WhereClause,
+        ),
+        ("CREATE INDEX idx ON ", CompletionContext::FromClause),
+    ] {
+        assert_eq!(
+            SqlParser::completion_context_from_text(sql, position_at_end(sql)),
+            expected,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn closed_subquery_clauses_do_not_override_active_outer_completion_context() {
+    for (marked, expected) in [
+        (
+            "WITH c AS (SELECT id FROM users WHERE id>0) SELECT na| FROM c",
+            CompletionContext::SelectClause,
+        ),
+        (
+            "WITH c AS (SELECT id FROM users WHERE id>0) SELECT * FROM us|",
+            CompletionContext::FromClause,
+        ),
+        (
+            "SELECT COALESCE((SELECT name FROM users WHERE id=1), na|) FROM users",
+            CompletionContext::SelectClause,
+        ),
+        (
+            "SELECT * FROM (SELECT id FROM users WHERE id>0) d WHERE d.na|",
+            CompletionContext::TableColumn,
+        ),
+    ] {
+        let byte = marked.find('|').unwrap();
+        let sql = marked.replace('|', "");
+        let point = crate::position::byte_position_at_end(&sql[..byte]);
+        let mut parser = SqlParser::new();
+        let tree = parser.parse_syntax_tree(&sql).unwrap();
+        let node = parser.get_node_at_position(&tree, point).unwrap();
+        assert_eq!(
+            parser.analyze_completion_context(node, &sql, point),
+            expected,
+            "{marked}"
+        );
+        assert_eq!(
+            SqlParser::completion_context_from_text(&sql, point),
+            expected,
+            "fallback {marked}"
+        );
+    }
 }

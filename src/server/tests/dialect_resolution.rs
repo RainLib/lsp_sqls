@@ -1,4 +1,17 @@
 use super::*;
+#[test]
+fn duckdb_uri_and_language_keep_the_registered_identity_before_configuration() {
+    for uri in ["file:///q.duckdb", "oxide://query/q.duckdb.sql"] {
+        assert_eq!(
+            infer_dialect_from_uri_and_language(uri, "mysql", "postgres"),
+            "duckdb"
+        );
+    }
+    assert_eq!(
+        infer_dialect_from_uri_and_language("untitled://1", "duckdb", "mysql"),
+        "duckdb"
+    );
+}
 
 #[test]
 fn infers_dialect_from_uri_before_language_id() {
@@ -63,5 +76,32 @@ fn falls_back_to_configured_default_dialect() {
     assert_eq!(
         infer_dialect_from_uri_and_language("untitled://1", "sql", "clickhouse"),
         "clickhouse"
+    );
+}
+
+#[test]
+fn sqlserver_language_and_uri_aliases_do_not_fall_back_to_default() {
+    for alias in ["sqlserver", "mssql", "tsql"] {
+        for uri in [
+            format!("file:///q.{alias}"),
+            format!("file:///q.{alias}.sql"),
+        ] {
+            assert_eq!(
+                infer_dialect_from_uri_and_language(&uri, "postgres", "mysql"),
+                "sqlserver"
+            );
+        }
+        assert_eq!(
+            infer_dialect_from_uri_and_language("untitled://1", alias, "mysql"),
+            "sqlserver"
+        );
+    }
+    assert_eq!(
+        infer_dialect_from_uri_and_language("untitled://1", "transact-sql", "postgres"),
+        "sqlserver"
+    );
+    assert_eq!(
+        infer_dialect_from_uri_and_language("file:///q.mysql.sql", "tsql", "sqlserver"),
+        "mysql"
     );
 }

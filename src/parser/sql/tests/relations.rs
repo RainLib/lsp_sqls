@@ -374,3 +374,59 @@ fn extracts_on_relation_for_index_trigger_and_policy_ddl() {
     assert!(references.contains(&"app.orders".to_string()));
     assert!(!references.contains(&"o.user_id".to_string()));
 }
+
+#[test]
+fn column_qualifier_stops_before_other_expressions_and_queries() {
+    for (marked, expected) in [
+        ("SELECT to<cursor>tal FROM app.orders o WHERE o.id=1", None),
+        ("SELECT to<cursor>tal + u.id FROM app.orders u", None),
+        (r#"SELECT "field.with.dot<cursor>" FROM app.users"#, None),
+        (
+            "SELECT u.na<cursor>me FROM app.users u WHERE EXISTS(SELECT x.id FROM other.x)",
+            Some("u"),
+        ),
+        (
+            "SELECT app.users.na<cursor>me FROM app.users",
+            Some("app.users"),
+        ),
+    ] {
+        let at = marked.find("<cursor>").unwrap();
+        let sql = marked.replace("<cursor>", "");
+        let mut parser = SqlParser::new();
+        let tree = parser.parse_syntax_tree(&sql).unwrap();
+        let position = crate::position::byte_position_at_end(&sql[..at]);
+        let node = parser.get_node_at_position(&tree, position).unwrap();
+        assert_eq!(
+            parser.get_table_name_for_column(node, &sql).as_deref(),
+            expected,
+            "{marked}"
+        );
+    }
+}
+
+#[test]
+fn active_row_sources_include_derived_aliases_without_their_body_tables() {
+    for marked in [
+        "SELECT <cursor> FROM (SELECT id FROM hidden) d JOIN users u ON u.id=d.id",
+        "SELECT <cursor> FROM users u, LATERAL (SELECT u.id FROM hidden h) AS d",
+    ] {
+        let at = marked.find("<cursor>").unwrap();
+        let sql = marked.replace("<cursor>", "");
+        let mut parser = SqlParser::new();
+        let tree = parser.parse_syntax_tree(&sql).unwrap();
+        let position = crate::position::byte_position_at_end(&sql[..at]);
+        let sources = parser.extract_row_sources_at_position(&tree, &sql, position);
+        assert!(
+            sources.iter().any(|name| name == "d"),
+            "{marked}: {sources:?}"
+        );
+        assert!(
+            sources.iter().any(|name| name == "users"),
+            "{marked}: {sources:?}"
+        );
+        assert!(
+            !sources.iter().any(|name| name == "hidden"),
+            "{marked}: {sources:?}"
+        );
+    }
+}

@@ -110,7 +110,7 @@ pub(super) fn default_function_case() -> KeywordCase {
 pub(super) fn dialect_uses_sql_preferences(dialect: &str) -> bool {
     matches!(
         dialect,
-        "postgres" | "mysql" | "sqlite" | "hive" | "clickhouse"
+        "postgres" | "mysql" | "sqlite" | "duckdb" | "hive" | "clickhouse" | "sqlserver"
     )
 }
 

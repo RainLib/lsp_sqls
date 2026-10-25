@@ -4,8 +4,10 @@ use crate::parser::SqlParser;
 use crate::schema::Schema;
 use async_trait::async_trait;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, Diagnostic, Hover, Location, MarkedString, Position,
+    CompletionItem, CompletionItemKind, Diagnostic, Hover, Location, Position,
 };
+
+mod lateral_views;
 
 pub struct HiveDialect {
     parser: std::sync::Mutex<SqlParser>,
@@ -59,7 +61,7 @@ impl HiveDialect {
             deprecated: None,
             preselect: None,
             sort_text: Some(format!("1{}", table.name)),
-            filter_text: None,
+            filter_text: Some(crate::identifier_search::filter_text(&table.name, None)),
             insert_text: Some(table.name.clone()),
             insert_text_format: None,
             insert_text_mode: None,
@@ -67,7 +69,7 @@ impl HiveDialect {
             additional_text_edits: None,
             commit_characters: None,
             command: None,
-            data: None,
+            data: crate::identifier_search::table_data(&table.name),
             tags: None,
             label_details: None,
         }
@@ -78,35 +80,7 @@ impl HiveDialect {
         column: &crate::schema::Column,
         table_name: Option<&str>,
     ) -> CompletionItem {
-        let label = if let Some(table) = table_name {
-            format!("{}.{}", table, column.name)
-        } else {
-            column.name.clone()
-        };
-
-        CompletionItem {
-            label,
-            kind: Some(CompletionItemKind::FIELD),
-            detail: Some(format!("Column: {} ({})", column.name, column.data_type)),
-            documentation: column
-                .comment
-                .clone()
-                .map(tower_lsp::lsp_types::Documentation::String),
-            deprecated: None,
-            preselect: None,
-            sort_text: Some(format!("2{}", column.name)),
-            filter_text: None,
-            insert_text: Some(column.name.clone()),
-            insert_text_format: None,
-            insert_text_mode: None,
-            text_edit: None,
-            additional_text_edits: None,
-            commit_characters: None,
-            command: None,
-            data: None,
-            tags: None,
-            label_details: None,
-        }
+        common::create_column_item(column, table_name)
     }
 }
 
@@ -116,10 +90,16 @@ impl Dialect for HiveDialect {
         "hive"
     }
 
-    async fn parse(&self, sql: &str, _schema: Option<&Schema>) -> Vec<Diagnostic> {
-        let mut parser = self.parser.lock().unwrap();
-        let parse_result = parser.parse(sql);
-        parse_result.diagnostics
+    async fn parse(&self, sql: &str, schema: Option<&Schema>) -> Vec<Diagnostic> {
+        self.parse_with_syntax(sql, schema).await.diagnostics
+    }
+
+    async fn parse_with_syntax(
+        &self,
+        sql: &str,
+        _schema: Option<&Schema>,
+    ) -> crate::parser::ParseResult {
+        common::validate_join_profile(self.parser.lock().unwrap().parse(sql), self.name())
     }
 
     async fn completion(
@@ -128,11 +108,74 @@ impl Dialect for HiveDialect {
         position: Position,
         schema: Option<&Schema>,
     ) -> Vec<CompletionItem> {
+        self.completion_snapshot(sql, position, schema).items
+    }
+
+    async fn completion_with_scope(
+        &self,
+        sql: &str,
+        position: Position,
+        schema: Option<&Schema>,
+        _context: Option<&tower_lsp::lsp_types::CompletionContext>,
+    ) -> crate::dialect::CompletionSnapshot {
+        self.completion_snapshot(sql, position, schema)
+    }
+
+    async fn hover(&self, sql: &str, position: Position, schema: Option<&Schema>) -> Option<Hover> {
+        let mut parser = self.parser.lock().unwrap();
+        common::schema_hover(&mut parser, sql, position, schema?, "Hive")
+    }
+
+    async fn goto_definition(
+        &self,
+        _sql: &str,
+        _position: Position,
+        _schema: Option<&Schema>,
+    ) -> Option<Location> {
+        None
+    }
+
+    async fn references(
+        &self,
+        _sql: &str,
+        _position: Position,
+        _schema: Option<&Schema>,
+    ) -> Vec<Location> {
+        Vec::new()
+    }
+
+    async fn format(&self, sql: &str) -> String {
+        common::format_sql_pretty(sql)
+    }
+
+    async fn validate(&self, sql: &str, schema: Option<&Schema>) -> Vec<Diagnostic> {
+        self.parse(sql, schema).await
+    }
+}
+
+impl HiveDialect {
+    fn completion_snapshot(
+        &self,
+        sql: &str,
+        position: Position,
+        schema: Option<&Schema>,
+    ) -> crate::dialect::CompletionSnapshot {
         let position = SqlParser::lsp_position_to_byte_position(sql, position);
         let mut parser = self.parser.lock().unwrap();
-        let parse_result = parser.parse(sql);
+        let syntax_tree = parser.parse_completion_tree(sql, position);
+        let mut snapshot = crate::dialect::CompletionSnapshot::for_sql(
+            &parser,
+            syntax_tree.as_ref(),
+            sql,
+            position,
+        );
 
-        let context = if let Some(tree) = &parse_result.tree {
+        if let Some(items) = lateral_views::entry_items(sql, position) {
+            snapshot.items = items;
+            return snapshot;
+        }
+
+        let context = if let Some(tree) = &syntax_tree {
             if let Some(node) = parser.get_node_at_position(tree, position) {
                 parser.analyze_completion_context(node, sql, position)
             } else {
@@ -144,6 +187,7 @@ impl Dialect for HiveDialect {
         let is_join_clause = context == crate::parser::CompletionContext::JoinClause;
 
         let mut items = Vec::new();
+        let mut value_policy = None;
         let keywords = &[
             "SELECT",
             "FROM",
@@ -218,11 +262,15 @@ impl Dialect for HiveDialect {
                     items.push(self.create_keyword_item(keyword));
                 }
                 if let Some(schema) = schema {
-                    for table in &schema.tables {
-                        items.push(self.create_table_item(table));
-                    }
+                    let prefix = common::cursor_prefix_excluding_keywords(
+                        sql,
+                        position,
+                        &["from", "join", "inner", "left", "right", "full", "cross"],
+                    );
+                    let qualified = common::cursor_has_identifier_qualifier(sql, position);
+                    common::add_schema_tables(&mut items, schema, &prefix, qualified, qualified);
                     if is_join_clause {
-                        if let Some(tree) = &parse_result.tree {
+                        if let Some(tree) = &syntax_tree {
                             let referenced_tables =
                                 parser.extract_referenced_tables_at_position(tree, sql, position);
                             let aliases = parser.extract_aliases_at_position(tree, sql, position);
@@ -242,6 +290,7 @@ impl Dialect for HiveDialect {
                 let prefix = common::cursor_prefix(sql, position);
                 for keyword in [
                     "AS",
+                    "LATERAL VIEW",
                     "JOIN",
                     "INNER JOIN",
                     "LEFT JOIN",
@@ -290,9 +339,10 @@ impl Dialect for HiveDialect {
                     }
                     items.push(self.create_keyword_item(keyword));
                 }
-                if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
-                    let referenced_tables =
-                        common::referenced_table_names_at_position(&parser, tree, sql, position);
+                if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
+                    let referenced_tables = common::referenced_table_names_at_position(
+                        &parser, tree, sql, position, schema,
+                    );
                     common::add_schema_columns(
                         &mut items,
                         schema,
@@ -347,20 +397,21 @@ impl Dialect for HiveDialect {
                     .collect();
 
                 if !predicate_operator_expected {
-                    if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
+                    if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
                         let referenced_tables = common::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         );
                         let use_table_prefix =
                             !matches!(latest_predicate_clause, Some("SET" | "UPDATE"))
                                 && referenced_tables.len() != 1;
-                        common::add_column_value_items(
+                        value_policy = common::add_column_value_items(
                             &mut items,
                             schema,
                             &referenced_tables,
                             sql,
                             position,
                             &prefix,
+                            "hive",
                         );
                         common::add_schema_columns(
                             &mut items,
@@ -521,9 +572,9 @@ impl Dialect for HiveDialect {
                         }
                         items.push(self.create_keyword_item(func));
                     }
-                    if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
+                    if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
                         let referenced_tables = common::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         );
                         let use_table_prefix = referenced_tables.len() != 1;
                         common::add_schema_columns(
@@ -551,9 +602,10 @@ impl Dialect for HiveDialect {
             }
             crate::parser::CompletionContext::UsingClause => {
                 let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["using"]);
-                if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
-                    let referenced_tables =
-                        common::referenced_table_names_at_position(&parser, tree, sql, position);
+                if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
+                    let referenced_tables = common::referenced_table_names_at_position(
+                        &parser, tree, sql, position, schema,
+                    );
                     common::add_schema_using_columns(
                         &mut items,
                         schema,
@@ -599,9 +651,10 @@ impl Dialect for HiveDialect {
             }
             crate::parser::CompletionContext::ColumnTargetClause => {
                 let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["column"]);
-                if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
-                    let referenced_tables =
-                        common::referenced_table_names_at_position(&parser, tree, sql, position);
+                if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
+                    let referenced_tables = common::referenced_table_names_at_position(
+                        &parser, tree, sql, position, schema,
+                    );
                     common::add_schema_columns(
                         &mut items,
                         schema,
@@ -615,9 +668,10 @@ impl Dialect for HiveDialect {
             crate::parser::CompletionContext::ConstraintTargetClause => {
                 let prefix =
                     common::cursor_prefix_excluding_keywords(sql, position, &["constraint"]);
-                if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
-                    let referenced_tables =
-                        common::referenced_table_names_at_position(&parser, tree, sql, position);
+                if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
+                    let referenced_tables = common::referenced_table_names_at_position(
+                        &parser, tree, sql, position, schema,
+                    );
                     common::add_schema_constraints(
                         &mut items,
                         schema,
@@ -677,20 +731,22 @@ impl Dialect for HiveDialect {
             crate::parser::CompletionContext::ExpressionValueClause => {
                 let prefix = common::cursor_prefix(sql, position);
                 if let Some(schema) = schema {
-                    let referenced_tables = parse_result
-                        .tree
+                    let referenced_tables = syntax_tree
                         .as_ref()
                         .map(|tree| {
-                            common::referenced_table_names_at_position(&parser, tree, sql, position)
+                            common::referenced_table_names_at_position(
+                                &parser, tree, sql, position, schema,
+                            )
                         })
                         .unwrap_or_default();
-                    common::add_column_value_items(
+                    value_policy = common::add_column_value_items(
                         &mut items,
                         schema,
                         &referenced_tables,
                         sql,
                         position,
                         &prefix,
+                        "hive",
                     );
                 }
                 let mut keywords =
@@ -714,7 +770,8 @@ impl Dialect for HiveDialect {
                     for table in &schema.tables {
                         for column in &table.columns {
                             if !prefix.is_empty()
-                                && !column.name.to_lowercase().starts_with(&prefix)
+                                && crate::identifier_search::column_match_rank(column, &prefix)
+                                    .is_none()
                             {
                                 continue;
                             }
@@ -789,9 +846,10 @@ impl Dialect for HiveDialect {
             }
             crate::parser::CompletionContext::IndexTargetClause => {
                 let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["index"]);
-                if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
-                    let referenced_tables =
-                        common::referenced_table_names_at_position(&parser, tree, sql, position);
+                if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
+                    let referenced_tables = common::referenced_table_names_at_position(
+                        &parser, tree, sql, position, schema,
+                    );
                     common::add_schema_indexes(
                         &mut items,
                         schema,
@@ -825,12 +883,14 @@ impl Dialect for HiveDialect {
                 }
             }
             crate::parser::CompletionContext::TableColumn => {
-                if let Some(tree) = &parse_result.tree {
+                if let Some(tree) = &syntax_tree {
                     if let Some(table_name) =
                         common::table_column_reference_at_position(&parser, tree, sql, position)
                     {
                         if let Some(schema) = schema {
-                            let aliases = SqlParser::relation_aliases_at_position(sql, position);
+                            let aliases = snapshot.relation_aliases.clone().unwrap_or_else(|| {
+                                SqlParser::relation_aliases_at_position(sql, position)
+                            });
                             let real_table_name =
                                 SqlParser::resolve_relation_alias(&aliases, &table_name)
                                     .map(|alias| alias.relation.as_str())
@@ -858,63 +918,19 @@ impl Dialect for HiveDialect {
             }
         }
 
-        if let (Some(schema), Some(_)) = (schema, parse_result.tree.as_ref()) {
-            let aliases = SqlParser::relation_aliases_at_position(sql, position);
+        if let (Some(schema), Some(tree)) = (schema, syntax_tree.as_ref()) {
+            let aliases = snapshot
+                .relation_aliases
+                .clone()
+                .unwrap_or_else(|| SqlParser::relation_aliases_at_position(sql, position));
             common::apply_column_aliases(&mut items, schema, &aliases);
+            common::apply_scoped_column_completion(
+                &mut items, &parser, tree, sql, position, schema, &context,
+            );
         }
 
-        items
-    }
-
-    async fn hover(
-        &self,
-        sql: &str,
-        _position: Position,
-        schema: Option<&Schema>,
-    ) -> Option<Hover> {
-        if let Some(schema) = schema {
-            for table in &schema.tables {
-                if sql.contains(&table.name) {
-                    return Some(Hover {
-                        contents: tower_lsp::lsp_types::HoverContents::Scalar(
-                            MarkedString::String(format!(
-                                "Hive Table: {}.{}\n{}",
-                                schema.database,
-                                table.name,
-                                table.comment.as_deref().unwrap_or("No description")
-                            )),
-                        ),
-                        range: None,
-                    });
-                }
-            }
-        }
-        None
-    }
-
-    async fn goto_definition(
-        &self,
-        _sql: &str,
-        _position: Position,
-        _schema: Option<&Schema>,
-    ) -> Option<Location> {
-        None
-    }
-
-    async fn references(
-        &self,
-        _sql: &str,
-        _position: Position,
-        _schema: Option<&Schema>,
-    ) -> Vec<Location> {
-        Vec::new()
-    }
-
-    async fn format(&self, sql: &str) -> String {
-        common::format_sql_pretty(sql)
-    }
-
-    async fn validate(&self, sql: &str, schema: Option<&Schema>) -> Vec<Diagnostic> {
-        self.parse(sql, schema).await
+        common::apply_value_completion_policy(&mut items, value_policy, "hive");
+        snapshot.items = items;
+        snapshot
     }
 }

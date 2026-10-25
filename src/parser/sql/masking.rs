@@ -1,5 +1,6 @@
 use super::types::SqlParser;
-use crate::placeholder::normalize_sql_placeholders;
+use crate::placeholder::{normalize_sql_placeholders_for_dialect, SqlPlaceholderDialect};
+use crate::sql_lexical::{lexical_rules_for, LexicalRules, LEGACY_LEXICAL_RULES};
 
 impl SqlParser {
     pub(crate) fn is_identifier_char(ch: char) -> bool {
@@ -32,27 +33,12 @@ impl SqlParser {
         index
     }
 
-    pub(super) fn starts_hash_comment(source: &str, index: usize) -> bool {
-        if !source[index..].starts_with('#') {
-            return false;
-        }
-
-        if source[index..].starts_with("#>") || source[index..].starts_with("#-") {
-            return false;
-        }
-
-        index == 0
-            || source[..index]
-                .chars()
-                .next_back()
-                .is_none_or(|ch| ch.is_whitespace())
-    }
-
     pub(super) fn mask_quoted_region(
         source: &str,
         output: &mut String,
         index: usize,
         quote: char,
+        escaped: bool,
     ) -> usize {
         let mut index = Self::push_masked_range(source, output, index, index + quote.len_utf8());
 
@@ -62,7 +48,7 @@ impl SqlParser {
             };
             index = Self::push_masked_range(source, output, index, index + ch.len_utf8());
 
-            if ch == '\\' && quote == '\'' && index < source.len() {
+            if escaped && ch == '\\' && index < source.len() {
                 let Some(escaped) = source[index..].chars().next() else {
                     break;
                 };
@@ -149,13 +135,62 @@ impl SqlParser {
     }
 
     pub(crate) fn mask_sql_noise(source: &str) -> String {
-        let normalized_source = normalize_sql_placeholders(source);
+        Self::mask_sql_regions(source, false, LEGACY_LEXICAL_RULES, None)
+    }
+
+    pub(crate) fn mask_sql_noise_for_dialect(source: &str, dialect: &str) -> String {
+        Self::mask_sql_regions(source, false, lexical_rules_for(dialect), None)
+    }
+
+    pub(crate) fn mask_sql_operand_context_for_dialect(source: &str, dialect: &str) -> String {
+        Self::mask_sql_regions(source, true, lexical_rules_for(dialect), None)
+    }
+
+    pub(crate) fn mask_sql_value_context_and_comments(
+        source: &str,
+        dialect: &str,
+        visitor: &mut dyn FnMut(std::ops::Range<usize>),
+    ) -> String {
+        Self::mask_sql_regions(source, true, lexical_rules_for(dialect), Some(visitor))
+    }
+
+    /// Visit only actual comment ranges while producing the same byte mask.
+    /// Consumers can collect directives without rescanning opaque SQL strings.
+    pub(crate) fn mask_sql_noise_and_comments_for_dialect(
+        source: &str,
+        dialect: &str,
+        visitor: &mut dyn FnMut(std::ops::Range<usize>),
+    ) -> String {
+        Self::mask_sql_regions(source, false, lexical_rules_for(dialect), Some(visitor))
+    }
+
+    pub(super) fn mask_sql_operand_context(source: &str, dialect: SqlPlaceholderDialect) -> String {
+        let rules = LexicalRules {
+            nested_comments: matches!(
+                dialect,
+                SqlPlaceholderDialect::Postgres | SqlPlaceholderDialect::SqlServer
+            ),
+            ..LEGACY_LEXICAL_RULES
+        };
+        Self::mask_sql_regions(source, true, rules, None)
+    }
+
+    fn mask_sql_regions(
+        source: &str,
+        operand_markers: bool,
+        rules: LexicalRules,
+        mut comments: Option<&mut dyn FnMut(std::ops::Range<usize>)>,
+    ) -> String {
+        let normalized_source = normalize_sql_placeholders_for_dialect(source, rules.placeholder);
         let source = normalized_source.as_str();
         let mut output = String::with_capacity(source.len());
         let mut index = 0;
 
         while index < source.len() {
-            if source[index..].starts_with("--") {
+            if source[index..].starts_with("--")
+                || rules.slash_comments && source[index..].starts_with("//")
+            {
+                let start = index;
                 while index < source.len() {
                     let Some(ch) = source[index..].chars().next() else {
                         break;
@@ -166,10 +201,14 @@ impl SqlParser {
                         break;
                     }
                 }
+                if let Some(visitor) = comments.as_mut() {
+                    visitor(start..index);
+                }
                 continue;
             }
 
-            if Self::starts_hash_comment(source, index) {
+            if rules.hash_comment_at(source, index) {
+                let start = index;
                 while index < source.len() {
                     let Some(ch) = source[index..].chars().next() else {
                         break;
@@ -179,22 +218,38 @@ impl SqlParser {
                     if ch == '\n' {
                         break;
                     }
+                }
+                if let Some(visitor) = comments.as_mut() {
+                    visitor(start..index);
                 }
                 continue;
             }
 
             if source[index..].starts_with("/*") {
+                let start = index;
                 index = Self::push_masked_range(source, &mut output, index, index + 2);
-                while index < source.len() {
-                    if source[index..].starts_with("*/") {
+                let mut depth = 1;
+                while index < source.len() && depth > 0 {
+                    if rules.nested_comments && source[index..].starts_with("/*") {
                         index = Self::push_masked_range(source, &mut output, index, index + 2);
-                        break;
+                        depth += 1;
+                    } else if source[index..].starts_with("*/") {
+                        index = Self::push_masked_range(source, &mut output, index, index + 2);
+                        depth -= 1;
+                    } else {
+                        let Some(ch) = source[index..].chars().next() else {
+                            break;
+                        };
+                        index = Self::push_masked_range(
+                            source,
+                            &mut output,
+                            index,
+                            index + ch.len_utf8(),
+                        );
                     }
-                    let Some(ch) = source[index..].chars().next() else {
-                        break;
-                    };
-                    index =
-                        Self::push_masked_range(source, &mut output, index, index + ch.len_utf8());
+                }
+                if let Some(visitor) = comments.as_mut() {
+                    visitor(start..index);
                 }
                 continue;
             }
@@ -203,22 +258,34 @@ impl SqlParser {
                 break;
             };
 
-            if ch == '$' {
+            if rules.dollar_quotes && ch == '$' {
                 if let Some(next_index) =
                     Self::mask_dollar_quoted_region(source, &mut output, index)
                 {
+                    if operand_markers {
+                        output.replace_range(index..index + 1, "x");
+                    }
                     index = next_index;
                     continue;
                 }
             }
 
             if matches!(ch, '\'' | '"' | '`') {
-                index = Self::mask_quoted_region(source, &mut output, index, ch);
+                let start = index;
+                let escaped = rules.escapes_at(source, index, ch);
+                index = Self::mask_quoted_region(source, &mut output, index, ch, escaped);
+                if operand_markers {
+                    output.replace_range(start..start + 1, "x");
+                }
                 continue;
             }
 
-            if ch == '[' {
+            if rules.bracket_identifiers && ch == '[' {
+                let start = index;
                 index = Self::mask_bracketed_identifier(source, &mut output, index);
+                if operand_markers {
+                    output.replace_range(start..start + 1, "x");
+                }
                 continue;
             }
 

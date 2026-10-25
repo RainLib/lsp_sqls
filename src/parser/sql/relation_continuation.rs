@@ -64,9 +64,10 @@ impl SqlParser {
                 "A", "AS", "J", "JO", "JOI", "JOIN", "I", "IN", "INN", "INNE", "INNER", "L", "LE",
                 "LEF", "LEFT", "R", "RI", "RIG", "RIGH", "RIGHT", "F", "FU", "FUL", "FULL", "C",
                 "CR", "CRO", "CROS", "CROSS", "W", "WH", "WHE", "WHER", "WHERE", "G", "GR", "GRO",
-                "GROU", "GROUP", "O", "OR", "ORD", "ORDE", "ORDER", "H", "HA", "HAV", "HAVI",
-                "HAVIN", "HAVING", "LI", "LIM", "LIMI", "LIMIT", "OF", "OFF", "OFFS", "OFFSE",
-                "OFFSET", "FE", "FET", "FETC", "FETCH",
+                "GROU", "GROUP", "O", "OR", "ORD", "ORDE", "ORDER", "H", "HA", "HAV", "HAVI", "Q",
+                "QU", "QUA", "QUAL", "QUALI", "QUALIF", "QUALIFY", "HAVIN", "HAVING", "LI", "LIM",
+                "LIMI", "LIMIT", "OF", "OFF", "OFFS", "OFFSE", "OFFSET", "FE", "FET", "FETC",
+                "FETCH", "LA", "LAT", "LATE", "LATER", "LATERA", "LATERAL",
             ],
         )
     }
@@ -111,7 +112,7 @@ impl SqlParser {
             after_select,
             statement_upper.len(),
             &[
-                "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "UNION",
+                "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "QUALIFY", "LIMIT", "UNION",
             ],
         ) {
             return false;
@@ -121,7 +122,13 @@ impl SqlParser {
             .rsplit(',')
             .next()
             .unwrap_or(&statement_upper[after_select..]);
-        Self::select_item_completed_or_prefixed(segment, &["A", "AS", "F", "FR", "FRO", "FROM"])
+        Self::select_item_completed_or_prefixed(
+            segment,
+            &[
+                "A", "AS", "F", "FR", "FRO", "FROM", "Q", "QU", "QUA", "QUAL", "QUALI", "QUALIF",
+                "QUALIFY",
+            ],
+        )
     }
 
     pub(super) fn select_item_completed_or_prefixed(

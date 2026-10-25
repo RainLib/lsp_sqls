@@ -112,6 +112,8 @@ async fn test_postgres_schema_aware_completion_filters_referenced_tables() {
     let dialect = PostgresDialect::new();
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "public".to_string(),
         server_version: None,
@@ -337,11 +339,22 @@ async fn test_postgres_schema_aware_completion_filters_referenced_tables() {
             .any(|item| item.label == "order_id" || item.label == "orders.order_id"),
         "subquery WHERE should suggest columns from the subquery table"
     );
+    let outer_name = subquery_items
+        .iter()
+        .find(|item| item.label == "users.name")
+        .expect("legal correlated outer field must retain its qualifier");
+    assert_eq!(outer_name.insert_text.as_deref(), Some("users.name"));
     assert!(
-        !subquery_items
-            .iter()
-            .any(|item| item.label == "users.name" || item.label == "name"),
-        "subquery WHERE should not suggest outer query columns"
+        !subquery_items.iter().any(|item| item.label == "name"),
+        "Outer fields must not be displayed as unqualified inner fields"
+    );
+    let inner = subquery_items
+        .iter()
+        .find(|item| item.label == "order_id" || item.label == "orders.order_id")
+        .unwrap();
+    assert!(
+        inner.sort_text.as_deref() < outer_name.sort_text.as_deref(),
+        "Current-query fields must rank ahead of correlated outer fields"
     );
 
     let cte_sql = "WITH recent_orders AS (SELECT * FROM orders) SELECT * FROM users WHERE ";
@@ -373,6 +386,8 @@ async fn test_postgres_completion_keeps_relation_targets_separate_from_column_ta
     let dialect = PostgresDialect::new();
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "public".to_string(),
         server_version: None,
@@ -558,6 +573,8 @@ async fn test_postgres_completion_uses_utf16_lsp_positions() {
     let dialect = PostgresDialect::new();
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "public".to_string(),
         server_version: None,
@@ -612,6 +629,8 @@ async fn test_mysql_schema_aware_select_completion_filters_referenced_tables() {
     let dialect = MysqlDialect::new();
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "shop".to_string(),
         server_version: None,
@@ -912,6 +931,8 @@ async fn test_mysql_schema_aware_select_completion_filters_referenced_tables() {
 async fn test_sql_completion_disambiguates_same_named_columns_before_from() {
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "public".to_string(),
         server_version: None,
@@ -1001,6 +1022,8 @@ async fn test_hive_dialect() {
 
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "default".to_string(),
         server_version: None,
@@ -1187,6 +1210,8 @@ async fn test_elasticsearch_dsl_filters_completions_by_server_version() {
     let dialect = ElasticsearchDslDialect::new();
     let schema = |version: &str| Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "default".to_string(),
         server_version: Some(version.to_string()),
@@ -1265,6 +1290,8 @@ async fn test_elasticsearch_dsl_schema_aware_fields() {
     let dialect = ElasticsearchDslDialect::new();
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "default".to_string(),
         server_version: None,
@@ -1504,6 +1531,8 @@ async fn test_elasticsearch_console_scopes_fields_to_request_index() {
     };
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "default".to_string(),
         server_version: None,
@@ -1620,6 +1649,8 @@ async fn test_clickhouse_dialect() {
 
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "default".to_string(),
         server_version: None,
@@ -1797,6 +1828,8 @@ async fn test_redis_schema_aware_key_completion_and_hover() {
     let dialect = RedisDialect::new();
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "0".to_string(),
         server_version: None,
@@ -1904,6 +1937,8 @@ async fn test_mongodb_dialect() {
 
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "app".to_string(),
         server_version: None,
@@ -2229,6 +2264,8 @@ async fn test_mongodb_filters_pipeline_stages_by_server_version() {
     let dialect = MongoDbDialect::new();
     let schema = |version: &str| Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "app".to_string(),
         server_version: Some(version.to_string()),
@@ -2277,6 +2314,8 @@ async fn sqlserver_catalog_qualified_alias_completion_is_exact() {
         .expect("SQL Server dialect");
     let schema = Schema {
         id: SchemaId::new(),
+        server: Some("ServerOne".into()),
+        namespace: None,
         catalog: Some("AppDb".to_string()),
         database: "dbo".to_string(),
         server_version: Some("16.0".to_string()),
@@ -2302,7 +2341,7 @@ async fn sqlserver_catalog_qualified_alias_completion_is_exact() {
 
     for sql in [
         "SELECT * FROM [ServerOne].[AppDb].[dbo].[Users] u WHERE u.",
-        "SELECT * FROM AppDb..Users u WHERE u.",
+        "SELECT * FROM AppDb.dbo.Users u WHERE u.",
     ] {
         let items = dialect
             .completion(
@@ -2320,7 +2359,7 @@ async fn sqlserver_catalog_qualified_alias_completion_is_exact() {
         );
     }
 
-    let table_sql = "SELECT * FROM AppDb..";
+    let table_sql = "SELECT * FROM AppDb.dbo.";
     let table_items = dialect
         .completion(
             table_sql,
@@ -2333,7 +2372,25 @@ async fn sqlserver_catalog_qualified_alias_completion_is_exact() {
         .await;
     assert!(
         table_items.iter().any(|item| item.label.ends_with("Users")),
-        "double-dot table completion should use AppDb.dbo metadata: {table_items:?}"
+        "explicit schema table completion should use AppDb.dbo metadata: {table_items:?}"
+    );
+
+    let unknown = "SELECT * FROM AppDb..Users u WHERE u.";
+    let items = dialect
+        .completion(
+            unknown,
+            tower_lsp::lsp_types::Position {
+                line: 0,
+                character: unknown.encode_utf16().count() as u32,
+            },
+            Some(&schema),
+        )
+        .await;
+    assert!(
+        !items
+            .iter()
+            .any(|i| i.kind == Some(tower_lsp::lsp_types::CompletionItemKind::FIELD)),
+        "omitted schema needs manager resolution, not a dbo guess: {items:?}"
     );
 
     let wrong_catalog_sql = "SELECT * FROM [ServerOne].[OtherDb].[dbo].[Users] u WHERE u.";
@@ -2361,6 +2418,8 @@ async fn test_dialect_with_schema() {
 
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "test_db".to_string(),
         server_version: None,
@@ -2415,6 +2474,8 @@ async fn test_postgres_completion_at_clause_keywords_matches_editor_flow() {
     let dialect = PostgresDialect::new();
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "public".to_string(),
         server_version: None,
@@ -2587,6 +2648,8 @@ async fn test_postgres_completion_at_clause_keywords_matches_editor_flow() {
 async fn test_schema_function_completion() {
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "test_db".to_string(),
         server_version: None,
@@ -2595,6 +2658,7 @@ async fn test_schema_function_completion() {
             name: "calculate_score".to_string(),
             routine_type: Some("function".to_string()),
             parameters: vec![FunctionParameter {
+                mode: None,
                 name: "user_id".to_string(),
                 data_type: "integer".to_string(),
                 optional: false,
@@ -2696,6 +2760,8 @@ fn hover_contents_to_string(contents: &tower_lsp::lsp_types::HoverContents) -> S
 async fn test_schema_function_hover() {
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "test_db".to_string(),
         server_version: None,
@@ -2704,6 +2770,7 @@ async fn test_schema_function_hover() {
             name: "calculate_score".to_string(),
             routine_type: Some("function".to_string()),
             parameters: vec![FunctionParameter {
+                mode: None,
                 name: "user_id".to_string(),
                 data_type: "integer".to_string(),
                 optional: false,
@@ -2807,6 +2874,8 @@ async fn test_intelligent_completion_logging() {
     // Shared Schema for tests
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "shop".to_string(),
         server_version: None,

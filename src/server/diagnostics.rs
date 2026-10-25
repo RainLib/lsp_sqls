@@ -1,51 +1,109 @@
 //! Diagnostics for the SQL language server.
-use super::document_structure::range_for_offsets;
-use super::schema_resolution::schema_table_matches;
-use super::semantic_tokens::sql_identifier_tokens;
+mod ambiguity;
+mod inspection_context;
+mod lateral_views;
+mod qualify;
+mod statement_structure;
 use crate::dialect::Dialect;
 use crate::parser::SqlParser;
 use crate::schema::Schema;
-use std::collections::HashMap;
-use std::collections::HashSet;
+pub(super) use inspection_context::Context as InspectionContext;
+#[cfg(test)]
+pub(super) use statement_structure::FALLBACK_PARSE_COUNT;
 use tower_lsp::lsp_types::*;
+#[cfg(test)]
 pub(super) async fn document_diagnostics(
     dialect: &dyn Dialect,
     text: &str,
     schema: Option<&Schema>,
 ) -> Vec<Diagnostic> {
-    let mut diagnostics = dialect.parse(text, schema).await;
-    if matches!(dialect.name(), "postgres" | "mysql" | "clickhouse" | "hive") {
-        diagnostics.extend(sql_inspection_diagnostics(text, schema, dialect.name()));
+    document_diagnostics_with_metadata(dialect, text, schema, None).await
+}
+pub(super) async fn document_diagnostics_with_metadata(
+    dialect: &dyn Dialect,
+    text: &str,
+    schema: Option<&Schema>,
+    manager: Option<&crate::schema::SchemaManager>,
+) -> Vec<Diagnostic> {
+    if !matches!(
+        dialect.name(),
+        "postgres" | "mysql" | "clickhouse" | "hive" | "sqlserver" | "sqlite" | "duckdb"
+    ) {
+        let mut diagnostics = dialect.parse(text, schema).await;
+        diagnostics.extend(qualify::diagnostics(text, dialect.name(), None));
+        diagnostics.extend(lateral_views::diagnostics(text, dialect.name(), None));
+        return diagnostics;
     }
+    let parsed = dialect.parse_with_syntax(text, schema).await;
+    // A snapshot is request-owned, and must describe the exact original text.
+    // Fall back to the established validation API for a mismatched provider.
+    let (mut diagnostics, tree) = if parsed.source == text {
+        (parsed.diagnostics, parsed.tree)
+    } else {
+        (dialect.parse(text, schema).await, None)
+    };
+    diagnostics.extend(qualify::diagnostics(text, dialect.name(), tree.as_ref()));
+    diagnostics.extend(lateral_views::diagnostics(
+        text,
+        dialect.name(),
+        tree.as_ref(),
+    ));
+    diagnostics.extend(sql_inspection_diagnostics_with_metadata(
+        text,
+        schema,
+        dialect.name(),
+        tree.as_ref(),
+        manager,
+    ));
     diagnostics
 }
 
+#[cfg(test)]
 pub(super) fn sql_inspection_diagnostics(
     text: &str,
     schema: Option<&Schema>,
     dialect_name: &str,
 ) -> Vec<Diagnostic> {
+    sql_inspection_diagnostics_with_syntax(text, schema, dialect_name, None)
+}
+#[cfg(test)]
+fn sql_inspection_diagnostics_with_syntax(
+    text: &str,
+    schema: Option<&Schema>,
+    dialect_name: &str,
+    tree: Option<&tree_sitter::Tree>,
+) -> Vec<Diagnostic> {
+    sql_inspection_diagnostics_with_metadata(text, schema, dialect_name, tree, None)
+}
+fn sql_inspection_diagnostics_with_metadata(
+    text: &str,
+    schema: Option<&Schema>,
+    dialect_name: &str,
+    tree: Option<&tree_sitter::Tree>,
+    manager: Option<&crate::schema::SchemaManager>,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let mut offset = 0usize;
-    for segment in text.split_inclusive(';') {
-        let trimmed_start = segment.len() - segment.trim_start().len();
-        let trimmed_end = segment.trim_end().len();
-        if trimmed_start >= trimmed_end {
-            offset += segment.len();
-            continue;
-        }
-        let statement_start = offset + trimmed_start;
-        let statement_end = offset + trimmed_end;
-        let statement = &text[statement_start..statement_end];
-        let normalized = SqlParser::mask_sql_noise(statement).to_ascii_uppercase();
-        let statement_range = range_for_offsets(text, statement_start, statement_end);
-
-        let mutating_without_where = (normalized.trim_start().starts_with("UPDATE ")
-            || normalized.trim_start().starts_with("DELETE "))
-            && !contains_sql_keyword(&normalized, "WHERE");
-        if mutating_without_where && !inspection_suppressed(statement, "OXIDE001") {
+    let context = InspectionContext::with_syntax(text, dialect_name, tree);
+    for span in context.statements() {
+        let statement_start = span.start;
+        let normalized = &context.normalized[span.clone()];
+        let suppressed = context.suppressions(&span);
+        for mutation in context
+            .mutations(&span)
+            .filter(|m| context.suppressions_at(&span, m.keyword) & 1 == 0)
+        {
+            let warning_span = if mutation.root
+                && mutation.owner.start >= span.start
+                && mutation.owner.end <= span.end
+            {
+                span.clone()
+            } else {
+                mutation.range.clone()
+            };
             diagnostics.push(Diagnostic {
-                range: statement_range,
+                // Most statements produce no diagnostic. Computing a range
+                // here avoids rescanning every full-source prefix eagerly.
+                range: context.range(warning_span.start, warning_span.end),
                 severity: Some(DiagnosticSeverity::WARNING),
                 code: Some(NumberOrString::String("OXIDE001".to_string())),
                 code_description: None,
@@ -58,33 +116,25 @@ pub(super) fn sql_inspection_diagnostics(
             });
         }
 
-        if let Some(join_relative) = join_without_condition_offset(&normalized) {
-            if !inspection_suppressed(statement, "OXIDE002") {
-                diagnostics.push(Diagnostic {
-                    range: range_for_offsets(
-                        text,
-                        statement_start + join_relative,
-                        statement_start + join_relative + "JOIN".len(),
-                    ),
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    code: Some(NumberOrString::String("OXIDE002".to_string())),
-                    code_description: None,
-                    source: Some("oxide-inspections".to_string()),
-                    message:
-                        "JOIN has no ON or USING condition and may create a Cartesian product."
-                            .to_string(),
-                    related_information: None,
-                    tags: None,
-                    data: None,
-                });
-            }
+        for join in context
+            .joins(&span)
+            .filter(|j| context.suppressions_at(&span, j.keyword) & 2 == 0)
+        {
+            diagnostics.push(Diagnostic {
+                range: context.range(join.keyword, join.keyword + 4),
+                severity: Some(DiagnosticSeverity::WARNING),
+                code: Some(NumberOrString::String("OXIDE002".into())),
+                source: Some("oxide-inspections".into()),
+                message: "JOIN has no ON or USING condition and may create a Cartesian product."
+                    .into(),
+                ..Default::default()
+            });
         }
 
-        if let Some(star_relative) = select_star_offset(&normalized) {
-            if !inspection_suppressed(statement, "OXIDE003") {
+        if let Some(star_relative) = select_star_offset(normalized) {
+            if suppressed & 4 == 0 {
                 diagnostics.push(Diagnostic {
-                    range: range_for_offsets(
-                        text,
+                    range: context.range(
                         statement_start + star_relative,
                         statement_start + star_relative + 1,
                     ),
@@ -100,190 +150,104 @@ pub(super) fn sql_inspection_diagnostics(
             }
         }
 
-        if !inspection_suppressed(statement, "OXIDE004") {
-            diagnostics.extend(ambiguous_column_diagnostics(
-                text,
-                statement,
-                statement_start,
-                schema,
-            ));
-        }
-
-        if !inspection_suppressed(statement, "OXIDE005") {
+        if suppressed & 16 == 0 {
             diagnostics.extend(dialect_risk_diagnostics(
-                text,
-                statement,
+                &context,
+                normalized,
                 statement_start,
-                dialect_name,
             ));
         }
-
-        offset += segment.len();
     }
+    diagnostics.extend(ambiguity::diagnostics_with_metadata(
+        &context, schema, manager,
+    ));
     diagnostics
 }
 
-pub(super) fn inspection_suppressed(statement: &str, code: &str) -> bool {
-    statement
-        .to_ascii_uppercase()
-        .contains(&format!("NOINSPECTION {}", code.to_ascii_uppercase()))
-}
-
-pub(super) fn join_without_condition_span(normalized: &str) -> Option<(usize, usize)> {
-    for (offset, _) in normalized.match_indices("JOIN") {
-        let before = normalized[..offset].trim_end();
-        let keyword_before = before.split_whitespace().next_back().unwrap_or_default();
-        if matches!(keyword_before, "CROSS" | "NATURAL") {
-            continue;
-        }
-        let tail = &normalized[offset + "JOIN".len()..];
-        let boundary = [
-            " JOIN ", " WHERE ", " GROUP ", " HAVING ", " ORDER ", " LIMIT ", " UNION ",
-        ]
-        .iter()
-        .filter_map(|keyword| tail.find(keyword))
-        .min()
-        .unwrap_or(tail.len());
-        let join_clause = &tail[..boundary];
-        if !contains_sql_keyword(join_clause, "ON") && !contains_sql_keyword(join_clause, "USING") {
-            let relation_end = join_clause.trim_end_matches(';').trim_end().len();
-            return Some((offset, offset + "JOIN".len() + relation_end));
-        }
-    }
-    None
-}
-
-pub(super) fn join_without_condition_offset(normalized: &str) -> Option<usize> {
-    join_without_condition_span(normalized).map(|(offset, _)| offset)
-}
-
-pub(super) fn ambiguous_column_diagnostics(
-    full_text: &str,
-    statement: &str,
+fn dialect_risk_diagnostics(
+    context: &InspectionContext,
+    normalized: &str,
     statement_start: usize,
-    schema: Option<&Schema>,
 ) -> Vec<Diagnostic> {
-    let Some(schema) = schema else {
-        return Vec::new();
-    };
-    let mut parser = SqlParser::new();
-    let Some(tree) = parser.parse(statement).tree else {
-        return Vec::new();
-    };
-    let referenced = parser.extract_tables(&tree, statement);
-    if referenced.len() < 2 {
+    if crate::placeholder::SqlPlaceholderDialect::for_name(Some(context.dialect))
+        == crate::placeholder::SqlPlaceholderDialect::Postgres
+        || context.dialect.eq_ignore_ascii_case("clickhouse")
+    {
         return Vec::new();
     }
-    let referenced_tables = schema
-        .tables
-        .iter()
-        .filter(|table| {
-            referenced
-                .iter()
-                .any(|reference| schema_table_matches(schema, reference, table))
-        })
-        .collect::<Vec<_>>();
-    if referenced_tables.len() < 2 {
-        return Vec::new();
-    }
-    let mut counts = HashMap::<String, usize>::new();
-    for table in referenced_tables {
-        for column in &table.columns {
-            *counts.entry(column.name.to_ascii_lowercase()).or_default() += 1;
-        }
-    }
-    let ambiguous = counts
-        .into_iter()
-        .filter_map(|(name, count)| (count > 1).then_some(name))
-        .collect::<HashSet<_>>();
-    if ambiguous.is_empty() {
-        return Vec::new();
-    }
-
-    sql_identifier_tokens(statement)
-        .into_iter()
-        .filter_map(|(identifier, start, end)| {
-            if !ambiguous.contains(&identifier.to_ascii_lowercase()) {
-                return None;
-            }
-            let qualified = statement[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|character| character == '.');
-            if qualified {
-                return None;
-            }
-            Some(Diagnostic {
-                range: range_for_offsets(
-                    full_text,
-                    statement_start + start,
-                    statement_start + end,
-                ),
-                severity: Some(DiagnosticSeverity::WARNING),
-                code: Some(NumberOrString::String("OXIDE004".to_string())),
-                code_description: None,
-                source: Some("oxide-inspections".to_string()),
-                message: format!(
-                    "Column `{identifier}` exists in multiple referenced relations; qualify it with an alias."
-                ),
-                related_information: None,
-                tags: None,
-                data: None,
-            })
-        })
-        .collect()
-}
-
-pub(super) fn dialect_risk_diagnostics(
-    full_text: &str,
-    statement: &str,
-    statement_start: usize,
-    dialect_name: &str,
-) -> Vec<Diagnostic> {
-    if dialect_name == "postgres" {
-        return Vec::new();
-    }
-    let normalized = SqlParser::mask_sql_noise(statement).to_ascii_uppercase();
     let mut risks = Vec::new();
     for (needle, message) in [
-        (
-            "ILIKE",
-            "ILIKE is PostgreSQL-specific and is not portable to this dialect.",
-        ),
+        ("ILIKE", "ILIKE may not be portable to this dialect."),
         (
             "::",
-            "The :: cast syntax is PostgreSQL-specific; use CAST(value AS type).",
+            "The PostgreSQL-style :: cast may not be portable; use CAST(value AS type).",
         ),
     ] {
         for (start, matched) in normalized.match_indices(needle) {
+            if needle == "ILIKE" && !keyword_at(normalized, start, needle) {
+                continue;
+            }
+            if needle == "::"
+                && crate::sql_lexical::lexical_rules_for(context.dialect).placeholder
+                    == crate::placeholder::SqlPlaceholderDialect::SqlServer
+                && sqlserver_static_call(
+                    &context.text[statement_start..statement_start + normalized.len()],
+                    normalized,
+                    start,
+                )
+            {
+                continue;
+            }
             risks.push(Diagnostic {
-                range: range_for_offsets(
-                    full_text,
+                range: context.range(
                     statement_start + start,
                     statement_start + start + matched.len(),
                 ),
                 severity: Some(DiagnosticSeverity::WARNING),
-                code: Some(NumberOrString::String("OXIDE005".to_string())),
-                code_description: None,
-                source: Some("oxide-inspections".to_string()),
-                message: message.to_string(),
-                related_information: None,
-                tags: None,
-                data: None,
+                code: Some(NumberOrString::String("OXIDE005".into())),
+                source: Some("oxide-inspections".into()),
+                message: message.into(),
+                ..Default::default()
             });
         }
     }
     risks
 }
+fn sqlserver_static_call(source: &str, normalized: &str, at: usize) -> bool {
+    let before = normalized[..at].trim_end();
+    let word = before
+        .rsplit(|ch: char| !SqlParser::is_identifier_char(ch))
+        .next()
+        .unwrap_or_default();
+    let named = word
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+        || source[..at].trim_end().ends_with([']', '"']);
+    let tail = normalized[at + 2..].trim_start();
+    let method = tail
+        .chars()
+        .take_while(|ch| SqlParser::is_identifier_char(*ch))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    named && tail[method..].trim_start().starts_with('(')
+}
+fn keyword_at(source: &str, start: usize, keyword: &str) -> bool {
+    let end = start + keyword.len();
+    !source[..start]
+        .chars()
+        .next_back()
+        .is_some_and(SqlParser::is_identifier_char)
+        && !source[end..]
+            .chars()
+            .next()
+            .is_some_and(SqlParser::is_identifier_char)
+}
 
 pub(super) fn contains_sql_keyword(normalized: &str, keyword: &str) -> bool {
-    normalized.match_indices(keyword).any(|(start, matched)| {
-        let end = start + matched.len();
-        let before = normalized[..start].chars().next_back();
-        let after = normalized[end..].chars().next();
-        !before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
-            && !after.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
-    })
+    normalized
+        .match_indices(keyword)
+        .any(|(start, _)| keyword_at(normalized, start, keyword))
 }
 
 pub(super) fn select_star_offset(normalized: &str) -> Option<usize> {

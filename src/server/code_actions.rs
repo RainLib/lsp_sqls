@@ -191,9 +191,27 @@ pub(super) fn column_qualification_sources(
     schema: &Schema,
     dialect_name: &str,
 ) -> Vec<ColumnQualificationSource> {
-    let aliases = SqlParser::relation_aliases_at_position(text, position);
     let byte_position = SqlParser::lsp_position_to_byte_position(text, position);
-    let references = parser.extract_row_sources_at_position(tree, text, byte_position);
+    let scope = parser
+        .uses_joined_scope(tree, text, byte_position)
+        .then(|| parser.relation_scope_for_member(tree, text, byte_position))
+        .flatten();
+    let unaliased: Vec<_> = scope
+        .as_ref()
+        .and_then(|s| s.occurrences.as_ref())
+        .into_iter()
+        .flatten()
+        .filter(|(_, alias)| alias.is_none())
+        .map(|(reference, _)| reference.as_str())
+        .collect();
+    let aliases = scope
+        .as_ref()
+        .map(|s| s.aliases.clone())
+        .unwrap_or_else(|| SqlParser::relation_aliases_at_position(text, byte_position));
+    let references = scope
+        .as_ref()
+        .map(|s| s.relations.clone())
+        .unwrap_or_else(|| parser.extract_row_sources_at_position(tree, text, byte_position));
     let mut sources = Vec::new();
 
     for alias in &aliases {
@@ -217,9 +235,12 @@ pub(super) fn column_qualification_sources(
         });
     }
     for reference in references {
-        if aliases
+        if !unaliased
             .iter()
-            .any(|alias| relation_name_matches(&alias.relation, &reference))
+            .any(|r| relation_name_matches(r, &reference))
+            && aliases
+                .iter()
+                .any(|alias| relation_name_matches(&alias.relation, &reference))
         {
             continue;
         }
@@ -457,6 +478,12 @@ pub(super) fn qualify_identifier_actions(
     let request_end = position_to_byte_offset(text, request_range.end);
     if request_start != request_end {
         let mut parser = SqlParser::new();
+        if matches!(
+            dialect_name,
+            "sqlite" | "sqlite3" | "cloudflare-d1" | "turso"
+        ) {
+            parser = parser.with_sqlite_joins();
+        }
         let parsed = parser.parse(text);
         let Some(tree) = parsed.tree.as_ref() else {
             return Vec::new();
@@ -492,6 +519,12 @@ pub(super) fn qualify_identifier_actions(
     }
 
     let mut parser = SqlParser::new();
+    if matches!(
+        dialect_name,
+        "sqlite" | "sqlite3" | "cloudflare-d1" | "turso"
+    ) {
+        parser = parser.with_sqlite_joins();
+    }
     let parsed = parser.parse(text);
     let Some(tree) = parsed.tree.as_ref() else {
         return Vec::new();
@@ -635,8 +668,9 @@ pub(super) fn expand_select_star_action(
     let mut parser = SqlParser::new();
     let parse_result = parser.parse(statement);
     let tree = parse_result.tree.as_ref()?;
-    let references = parser.extract_referenced_tables(tree, statement);
-    let aliases = parser.extract_aliases(tree, statement);
+    let position = crate::position::byte_position_at_end(&statement[..star - statement_start]);
+    let references = parser.extract_row_sources_at_position(tree, statement, position);
+    let aliases = parser.extract_aliases_at_position(tree, statement, position);
     let mut sources = Vec::<(&Table, String)>::new();
 
     if let Some(qualifier) = qualifier.as_deref() {

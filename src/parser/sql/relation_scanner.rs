@@ -90,7 +90,7 @@ impl SqlParser {
         Self::skip_whitespace(source, index)
     }
 
-    pub(super) fn read_identifier_part(source: &str, index: usize) -> Option<(String, usize)> {
+    pub(crate) fn read_identifier_part(source: &str, index: usize) -> Option<(String, usize)> {
         let index = Self::skip_whitespace(source, index);
         if let Some(span) = placeholder_at(source, index) {
             return Some((PLACEHOLDER_IDENTIFIER.to_string(), span.end));
@@ -124,6 +124,11 @@ impl SqlParser {
                 let ch = source[end..].chars().next()?;
                 end += ch.len_utf8();
                 if ch == ']' {
+                    if source[end..].starts_with(']') {
+                        part.push(']');
+                        end += 1;
+                        continue;
+                    }
                     return Some((part, end));
                 }
                 part.push(ch);
@@ -162,7 +167,7 @@ impl SqlParser {
             index += 1;
             let next_part = Self::skip_whitespace(source, index);
             if source[next_part..].starts_with('.') {
-                parts.push("dbo".to_string());
+                parts.push(String::new());
                 index = next_part;
                 continue;
             }
@@ -173,7 +178,7 @@ impl SqlParser {
             index = next_index;
         }
 
-        Some((parts.join("."), index))
+        Some((Self::identifier_path_from_parts(&parts), index))
     }
 
     pub(super) fn skip_parenthesized_region(source: &str, index: usize) -> usize {
@@ -208,7 +213,21 @@ impl SqlParser {
         index: usize,
     ) -> Option<(String, usize)> {
         let index = Self::skip_relation_modifiers(source, index);
+        if let Some(reference) = Self::read_table_variable_reference(source, index) {
+            return Some(reference);
+        }
         Self::read_identifier_path(source, index)
+    }
+
+    // In a row-source position, a T-SQL @name is an identifier rather than
+    // the opaque named placeholder used by scalar-expression scanning.
+    fn read_table_variable_reference(source: &str, index: usize) -> Option<(String, usize)> {
+        if !source[index..].starts_with('@') || source[index..].starts_with("@@") {
+            return None;
+        }
+        let end = crate::tsql_identifier::prefix_end(source, index)?;
+        crate::tsql_identifier::is_complete_name(&source[index..end])
+            .then(|| (source[index..end].to_string(), end))
     }
 
     pub(super) fn read_relation_reference_after_preserving_trailing(
@@ -216,6 +235,9 @@ impl SqlParser {
         index: usize,
     ) -> Option<(String, usize)> {
         let index = Self::skip_relation_modifiers(source, index);
+        if let Some(reference) = Self::read_table_variable_reference(source, index) {
+            return Some(reference);
+        }
         Self::read_identifier_path_preserving_trailing(source, index)
     }
 
@@ -231,17 +253,17 @@ impl SqlParser {
             let after_part = index;
             let dot_index = Self::skip_whitespace(source, index);
             if !source[dot_index..].starts_with('.') {
-                return Some((parts.join("."), after_part));
+                return Some((Self::identifier_path_from_parts(&parts), after_part));
             }
             index = dot_index + 1;
             let next_part = Self::skip_whitespace(source, index);
             if source[next_part..].starts_with('.') {
-                parts.push("dbo".to_string());
+                parts.push(String::new());
                 index = next_part;
                 continue;
             }
             let Some((part, next_index)) = Self::read_identifier_part(source, index) else {
-                return Some((parts.join("."), after_part));
+                return Some((Self::identifier_path_from_parts(&parts), after_part));
             };
             parts.push(part);
             index = next_index;
@@ -266,6 +288,13 @@ impl SqlParser {
                     Self::consume_word(searchable_source, after_with, "ORDINALITY")
                 {
                     index = after_ordinality;
+                } else {
+                    // OPENJSON's WITH schema is after the argument list. This
+                    // branch cannot consume WITH table hints on a base table.
+                    let declaration = Self::skip_whitespace(source, after_with);
+                    if searchable_source[declaration..].starts_with('(') {
+                        index = Self::skip_parenthesized_region(searchable_source, declaration);
+                    }
                 }
             }
         }
@@ -275,11 +304,13 @@ impl SqlParser {
 
         let alias_start = Self::skip_whitespace(source, index);
         let (alias, next_index) = Self::read_identifier_part(source, alias_start)?;
-        if Keywords::is_keyword(&alias)
-            || matches!(
-                alias.to_ascii_uppercase().as_str(),
-                "ON" | "USING" | "WHERE" | "SET" | "VALUES" | "RETURNING" | "GROUP" | "ORDER"
-            )
+        let quoted = matches!(source.as_bytes().get(alias_start), Some(b'"' | b'`' | b'['));
+        if !quoted
+            && (Keywords::is_keyword(&alias)
+                || matches!(
+                    alias.to_ascii_uppercase().as_str(),
+                    "ON" | "USING" | "WHERE" | "SET" | "VALUES" | "RETURNING" | "GROUP" | "ORDER"
+                ))
         {
             return None;
         }

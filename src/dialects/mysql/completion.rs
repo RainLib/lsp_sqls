@@ -9,13 +9,15 @@ pub(super) fn completion(
     sql: &str,
     position: Position,
     schema: Option<&Schema>,
-) -> Vec<CompletionItem> {
+) -> crate::dialect::CompletionSnapshot {
     let position = SqlParser::lsp_position_to_byte_position(sql, position);
     let mut parser = dialect.parser.lock().unwrap();
-    let parse_result = parser.parse(sql);
+    let syntax_tree = parser.parse_completion_tree(sql, position);
+    let mut snapshot =
+        crate::dialect::CompletionSnapshot::for_sql(&parser, syntax_tree.as_ref(), sql, position);
 
     // 分析补全上下文
-    let context = if let Some(tree) = &parse_result.tree {
+    let context = if let Some(tree) = &syntax_tree {
         if let Some(node) = parser.get_node_at_position(tree, position) {
             parser.analyze_completion_context(node, sql, position)
         } else {
@@ -27,6 +29,7 @@ pub(super) fn completion(
     let is_join_clause = context == crate::parser::CompletionContext::JoinClause;
 
     let mut items = Vec::new();
+    let mut value_policy = None;
 
     // 根据上下文提供不同的补全
     match context {
@@ -36,9 +39,15 @@ pub(super) fn completion(
             if let Some(schema) = schema {
                 let qualify_with_database =
                     MysqlDialect::cursor_has_identifier_qualifier(sql, position);
-                common::add_schema_tables(&mut items, schema, &prefix, qualify_with_database);
+                common::add_schema_tables(
+                    &mut items,
+                    schema,
+                    &prefix,
+                    qualify_with_database,
+                    qualify_with_database,
+                );
                 if is_join_clause {
-                    if let Some(tree) = &parse_result.tree {
+                    if let Some(tree) = &syntax_tree {
                         let referenced_tables =
                             parser.extract_referenced_tables_at_position(tree, sql, position);
                         let aliases = parser.extract_aliases_at_position(tree, sql, position);
@@ -95,12 +104,11 @@ pub(super) fn completion(
             let prefix =
                 common::cursor_prefix_excluding_keywords(sql, position, &["select", "distinct"]);
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         MysqlDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -201,20 +209,21 @@ pub(super) fn completion(
             let latest_predicate_clause = common::latest_predicate_clause(sql, position);
             if !predicate_operator_expected {
                 if let Some(schema) = schema {
-                    if let Some(tree) = &parse_result.tree {
+                    if let Some(tree) = &syntax_tree {
                         let referenced_tables = MysqlDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         );
                         let use_table_prefix =
                             !matches!(latest_predicate_clause, Some("SET" | "UPDATE"))
                                 && referenced_tables.len() > 1;
-                        common::add_column_value_items(
+                        value_policy = common::add_column_value_items(
                             &mut items,
                             schema,
                             &referenced_tables,
                             sql,
                             position,
                             &prefix,
+                            dialect.value_profile,
                         );
                         dialect.add_schema_columns(
                             &mut items,
@@ -260,9 +269,9 @@ pub(super) fn completion(
             // 添加列名补全 (优先级高)
             if let Some(schema) = schema {
                 // Check if query has multiple tables (to decide whether to use table prefix)
-                if let Some(tree) = &parse_result.tree {
+                if let Some(tree) = &syntax_tree {
                     let referenced_tables = MysqlDialect::referenced_table_names_at_position(
-                        &parser, tree, sql, position,
+                        &parser, tree, sql, position, schema,
                     );
                     let use_table_prefix = referenced_tables.len() != 1;
                     dialect.add_schema_columns(
@@ -315,9 +324,9 @@ pub(super) fn completion(
             // 添加列名补全
             if let Some(schema) = schema {
                 // Check if query has multiple tables (to decide whether to use table prefix)
-                if let Some(tree) = &parse_result.tree {
+                if let Some(tree) = &syntax_tree {
                     let referenced_tables = MysqlDialect::referenced_table_names_at_position(
-                        &parser, tree, sql, position,
+                        &parser, tree, sql, position, schema,
                     );
                     let use_table_prefix = referenced_tables.len() != 1;
                     dialect.add_schema_columns(
@@ -362,9 +371,9 @@ pub(super) fn completion(
 
             if !predicate_operator_expected {
                 if let Some(schema) = schema {
-                    if let Some(tree) = &parse_result.tree {
+                    if let Some(tree) = &syntax_tree {
                         let referenced_tables = MysqlDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         );
                         let use_table_prefix = referenced_tables.len() != 1;
                         dialect.add_schema_columns(
@@ -435,9 +444,9 @@ pub(super) fn completion(
         crate::parser::CompletionContext::UsingClause => {
             let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["using"]);
             if let Some(schema) = schema {
-                if let Some(tree) = &parse_result.tree {
+                if let Some(tree) = &syntax_tree {
                     let referenced_tables = MysqlDialect::referenced_table_names_at_position(
-                        &parser, tree, sql, position,
+                        &parser, tree, sql, position, schema,
                     );
                     common::add_schema_using_columns(
                         &mut items,
@@ -499,9 +508,10 @@ pub(super) fn completion(
 
         crate::parser::CompletionContext::ColumnTargetClause => {
             let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["column"]);
-            if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
-                let referenced_tables =
-                    MysqlDialect::referenced_table_names_at_position(&parser, tree, sql, position);
+            if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
+                let referenced_tables = MysqlDialect::referenced_table_names_at_position(
+                    &parser, tree, sql, position, schema,
+                );
                 common::add_schema_columns(
                     &mut items,
                     schema,
@@ -515,9 +525,10 @@ pub(super) fn completion(
 
         crate::parser::CompletionContext::ConstraintTargetClause => {
             let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["constraint"]);
-            if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
-                let referenced_tables =
-                    MysqlDialect::referenced_table_names_at_position(&parser, tree, sql, position);
+            if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
+                let referenced_tables = MysqlDialect::referenced_table_names_at_position(
+                    &parser, tree, sql, position, schema,
+                );
                 common::add_schema_constraints(
                     &mut items,
                     schema,
@@ -604,22 +615,22 @@ pub(super) fn completion(
         crate::parser::CompletionContext::ExpressionValueClause => {
             let prefix = common::cursor_prefix(sql, position);
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         MysqlDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
-                common::add_column_value_items(
+                value_policy = common::add_column_value_items(
                     &mut items,
                     schema,
                     &referenced_tables,
                     sql,
                     position,
                     &prefix,
+                    dialect.value_profile,
                 );
             }
             let mut keywords = vec![
@@ -646,12 +657,11 @@ pub(super) fn completion(
         crate::parser::CompletionContext::CaseResultClause => {
             let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["then", "else"]);
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         MysqlDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -754,12 +764,11 @@ pub(super) fn completion(
         crate::parser::CompletionContext::IndexTargetClause => {
             let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["index"]);
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         MysqlDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -800,25 +809,35 @@ pub(super) fn completion(
 
         crate::parser::CompletionContext::TableColumn => {
             // 表名.列名：只补全特定表的列名
-            if let Some(tree) = &parse_result.tree {
+            if let Some(tree) = &syntax_tree {
                 if let Some(table_name) =
                     common::table_column_reference_at_position(&parser, tree, sql, position)
                 {
                     if let Some(schema) = schema {
-                        let aliases = SqlParser::relation_aliases_at_position(sql, position);
+                        let aliases = snapshot.relation_aliases.clone().unwrap_or_else(|| {
+                            SqlParser::relation_aliases_at_position(sql, position)
+                        });
 
                         // Resolve aliases with SQL quoting/casing semantics.
-                        let real_table_name =
-                            SqlParser::resolve_relation_alias(&aliases, &table_name)
-                                .map(|alias| alias.relation.as_str())
-                                .unwrap_or(table_name.as_str());
-
+                        let real_table_name = common::row_reference(schema, &aliases, &table_name);
                         if let Some(table) =
                             MysqlDialect::find_table_by_reference(schema, real_table_name)
                         {
                             for column in &table.columns {
                                 items.push(dialect.create_column_item(column, None));
                             }
+                        } else if SqlParser::resolve_relation_alias(&aliases, &table_name).is_none()
+                        {
+                            // An unresolved qualifier can name a schema function.
+                            // Keep this existing SELECT capability while editing
+                            // a qualified member prefix in the middle of a token.
+                            dialect.add_schema_functions(
+                                &mut items,
+                                schema,
+                                &common::cursor_prefix(sql, position),
+                                "1",
+                                true,
+                            );
                         }
                     }
                 }
@@ -849,6 +868,7 @@ pub(super) fn completion(
                     schema,
                     &prefix,
                     MysqlDialect::cursor_has_identifier_qualifier(sql, position),
+                    MysqlDialect::cursor_has_identifier_qualifier(sql, position),
                 );
                 dialect.add_schema_functions(
                     &mut items,
@@ -861,10 +881,18 @@ pub(super) fn completion(
         }
     }
 
-    if let (Some(schema), Some(_)) = (schema, parse_result.tree.as_ref()) {
-        let aliases = SqlParser::relation_aliases_at_position(sql, position);
+    if let (Some(schema), Some(tree)) = (schema, syntax_tree.as_ref()) {
+        let aliases = snapshot
+            .relation_aliases
+            .clone()
+            .unwrap_or_else(|| SqlParser::relation_aliases_at_position(sql, position));
         common::apply_column_aliases(&mut items, schema, &aliases);
+        common::apply_scoped_column_completion(
+            &mut items, &parser, tree, sql, position, schema, &context,
+        );
     }
 
-    items
+    common::apply_value_completion_policy(&mut items, value_policy, dialect.value_profile);
+    snapshot.items = items;
+    snapshot
 }

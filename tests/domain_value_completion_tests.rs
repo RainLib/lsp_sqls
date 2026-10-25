@@ -5,9 +5,137 @@ use sql_lsp::dialects::{
 use sql_lsp::schema::{Column, Schema, SchemaId, Table};
 use tower_lsp::lsp_types::{CompletionItemKind, InsertTextFormat, Position};
 
+async fn bit_literals(profile: &str, data_type: &str, expected: &[&str]) {
+    let dialect = sql_lsp::dialects::DialectRegistry::new()
+        .get_by_name(profile)
+        .unwrap();
+    let mut catalog = schema();
+    catalog.tables[0].columns.push(Column {
+        name: "flags".into(),
+        data_type: data_type.into(),
+        ..Default::default()
+    });
+    for sql in [
+        "SELECT * FROM jobs WHERE flags = ",
+        "UPDATE jobs SET flags = ",
+        "SELECT * FROM jobs WHERE flags IN (",
+    ] {
+        let items = dialect
+            .completion(sql, Position::new(0, sql.len() as u32), Some(&catalog))
+            .await;
+        for label in expected {
+            assert!(
+                items.iter().any(|item| item.label == *label),
+                "{profile} {data_type}: missing {label}: {items:?}"
+            );
+        }
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.kind == Some(CompletionItemKind::KEYWORD)
+                    && ["TRUE", "FALSE"].contains(&item.label.as_str())),
+            "{profile} {data_type} must not offer Boolean keywords for bit storage"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlserver_bit_literals_are_numeric() {
+    bit_literals("sqlserver", "bit", &["0", "1", "NULL"]).await;
+}
+#[tokio::test]
+async fn postgres_fixed_bit_literals_keep_the_declared_width() {
+    bit_literals("postgres", "bit(3)", &["B'000'", "B'001'", "NULL"]).await;
+}
+#[tokio::test]
+async fn postgres_varbit_literals_keep_variable_width() {
+    bit_literals("postgres", "bit varying(8)", &["B'0'", "B'1'"]).await;
+}
+#[tokio::test]
+async fn mysql_bit_literals_are_binary_values() {
+    bit_literals("mysql", "BIT(3)", &["B'000'", "B'001'"]).await;
+}
+#[tokio::test]
+async fn duckdb_bit_literals_use_an_explicit_cast_on_the_existing_baseline() {
+    bit_literals("duckdb", "BIT", &["'0'::BIT", "'1'::BIT"]).await;
+}
+#[tokio::test]
+async fn sqlite_bit_affinity_uses_numeric_literals() {
+    bit_literals("sqlite", "BIT", &["0", "1"]).await;
+}
+#[tokio::test]
+async fn postgres_boolean_arrays_do_not_inherit_scalar_truth_keywords() {
+    let dialect = PostgresDialect::new();
+    let mut catalog = schema();
+    catalog.tables[0].columns[3].data_type = "boolean[]".into();
+    let sql = "SELECT * FROM jobs WHERE enabled = ";
+    let items = dialect
+        .completion(sql, Position::new(0, sql.len() as u32), Some(&catalog))
+        .await;
+    assert!(items.iter().any(|item| item.label == "NULL"));
+    assert!(!items
+        .iter()
+        .any(|item| item.kind == Some(CompletionItemKind::KEYWORD)
+            && ["TRUE", "FALSE"].contains(&item.label.as_str())));
+}
+
+#[tokio::test]
+async fn typed_values_do_not_leak_from_a_completed_predicate_into_new_operands() {
+    let dialect = PostgresDialect::new();
+    for sql in [
+        "SELECT * FROM jobs WHERE title = 'ready' AND ",
+        "SELECT * FROM jobs WHERE attempts = 1 OR ",
+        "SELECT (enabled = TRUE) FROM jobs WHERE ",
+    ] {
+        let items = dialect
+            .completion(sql, Position::new(0, sql.len() as u32), Some(&schema()))
+            .await;
+        assert!(
+            items
+                .iter()
+                .any(|item| item.label == "TRUE" && item.kind == Some(CompletionItemKind::KEYWORD)),
+            "{sql}"
+        );
+        assert!(
+            !items.iter().any(|item| item
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(" for title")
+                    || detail.contains(" for attempts")
+                    || detail.contains(" for enabled"))),
+            "{sql}: {items:?}"
+        );
+    }
+}
+#[tokio::test]
+async fn in_list_and_between_bounds_keep_the_numeric_field_type() {
+    let dialect = PostgresDialect::new();
+    for sql in [
+        "SELECT * FROM jobs WHERE attempts IN (1, ",
+        "SELECT * FROM jobs WHERE attempts BETWEEN ",
+        "SELECT * FROM jobs WHERE attempts BETWEEN 1 AND ",
+    ] {
+        let items = dialect
+            .completion(sql, Position::new(0, sql.len() as u32), Some(&schema()))
+            .await;
+        assert!(
+            items.iter().any(|item| item.label == "0"),
+            "{sql}: {items:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.label == "TRUE" && item.kind == Some(CompletionItemKind::KEYWORD)),
+            "{sql}"
+        );
+    }
+}
+
 fn schema() -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "app".to_string(),
         server_version: None,
@@ -50,6 +178,78 @@ fn schema() -> Schema {
         functions: vec![],
         source_uri: None,
     }
+}
+
+#[tokio::test]
+async fn value_reference_uses_the_qualified_relation_and_keeps_unknown_qualifiers_conservative() {
+    let mut catalog = schema();
+    catalog.tables.push(Table {
+        name: "metrics".into(),
+        columns: vec![Column {
+            name: "title".into(),
+            data_type: "integer".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let dialect = PostgresDialect::new();
+    for (sql, expected, absent) in [
+        (
+            "SELECT * FROM jobs j CROSS JOIN metrics m WHERE j.title = ",
+            Some("''"),
+            Some("0"),
+        ),
+        (
+            "SELECT * FROM jobs j CROSS JOIN metrics m WHERE m.title = ",
+            Some("0"),
+            Some("''"),
+        ),
+        (
+            "SELECT * FROM jobs j CROSS JOIN metrics m WHERE missing.title = ",
+            None,
+            Some("''"),
+        ),
+        (
+            "SELECT * FROM jobs j WHERE EXISTS (SELECT 1 FROM metrics m WHERE j.title = ",
+            Some("''"),
+            Some("0"),
+        ),
+    ] {
+        let items = dialect
+            .completion(sql, Position::new(0, sql.len() as u32), Some(&catalog))
+            .await;
+        if let Some(label) = expected {
+            assert!(
+                items.iter().any(|item| item.label == label),
+                "{sql}: {items:?}"
+            );
+        }
+        if let Some(label) = absent {
+            assert!(
+                !items.iter().any(|item| item.label == label),
+                "{sql}: {items:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn domain_value_prefix_search_happens_before_the_candidate_limit() {
+    let mut catalog = schema();
+    catalog.tables[0].columns[0].data_type = format!(
+        "enum({})",
+        (0..100)
+            .map(|i| format!("'value{i:03}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let sql = "SELECT * FROM jobs WHERE status = value099";
+    let items = MysqlDialect::new()
+        .completion(sql, Position::new(0, sql.len() as u32), Some(&catalog))
+        .await;
+    assert!(items
+        .iter()
+        .any(|item| item.label == "value099" && item.insert_text.as_deref() == Some("'value099'")));
 }
 
 async fn assert_domain_completion(name: &str, dialect: &dyn Dialect) {

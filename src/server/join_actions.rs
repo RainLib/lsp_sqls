@@ -1,8 +1,7 @@
 //! Join actions for the SQL language server.
 use super::completion_context::position_to_byte_offset;
 use super::completion_identifiers::quote_completion_identifier;
-use super::diagnostics::join_without_condition_span;
-use super::document_structure::range_for_offsets;
+use super::diagnostics::InspectionContext;
 use super::schema_resolution::schema_table_matches;
 use super::signature_help::single_document_edit;
 use crate::parser::SqlParser;
@@ -98,21 +97,17 @@ pub(super) fn add_join_condition_actions(
     const MAX_INFERRED_JOIN_ACTIONS: usize = 16;
 
     let join_start = position_to_byte_offset(text, diagnostic.range.start).min(text.len());
-    let statement_start = text[..join_start].rfind(';').map_or(0, |offset| offset + 1);
-    let statement_end = text[join_start..]
-        .find(';')
-        .map_or(text.len(), |offset| join_start + offset + 1);
-    let statement = &text[statement_start..statement_end];
-    let normalized = SqlParser::mask_sql_noise(statement).to_ascii_uppercase();
-    let expected_join = join_start.saturating_sub(statement_start);
-    let Some((join_relative, insert_relative)) = join_without_condition_span(&normalized) else {
+    let context = InspectionContext::new(text, dialect_name);
+    let Some(span) = context.statement_at(join_start) else {
         return Vec::new();
     };
-    if join_relative != expected_join || insert_relative > statement.len() {
+    let Some(join) = context.joins(&span).find(|join| join.keyword == join_start) else {
         return Vec::new();
-    }
-    let insert_offset = statement_start + insert_relative;
-    let insert_range = range_for_offsets(text, insert_offset, insert_offset);
+    };
+    let Some(insert_offset) = join.insert else {
+        return Vec::new();
+    };
+    let insert_range = context.range(insert_offset, insert_offset);
     let fallback = || CodeAction {
         title: "Add non-matching JOIN safety guard".to_string(),
         kind: Some(CodeActionKind::QUICKFIX),
@@ -129,12 +124,15 @@ pub(super) fn add_join_condition_actions(
     let Some(schema) = schema else {
         return vec![fallback()];
     };
-    let join_prefix = &statement[..insert_relative];
-    let mut parser = SqlParser::new();
+    let join_prefix = &text[join.scope_start..insert_offset];
+    let mut parser = SqlParser::new_with_placeholder_dialect(
+        crate::sql_lexical::lexical_rules_for(dialect_name).placeholder,
+    );
     let Some(tree) = parser.parse(join_prefix).tree else {
         return vec![fallback()];
     };
-    let references = parser.extract_referenced_tables(&tree, join_prefix);
+    let position = crate::position::byte_position_at_end(join_prefix);
+    let references = parser.extract_referenced_tables_at_position(&tree, join_prefix, position);
     let Some(candidate_reference) = references.last() else {
         return vec![fallback()];
     };
@@ -148,7 +146,7 @@ pub(super) fn add_join_condition_actions(
     else {
         return vec![fallback()];
     };
-    let aliases = parser.extract_aliases(&tree, join_prefix);
+    let aliases = parser.extract_aliases_at_position(&tree, join_prefix, position);
     let Some(candidate_qualifier) = join_reference_qualifier(
         schema,
         candidate,

@@ -5,6 +5,27 @@ use super::soft_statements::{
 use super::types::SqlParser;
 
 impl SqlParser {
+    /// The final FROM in IS [NOT] DISTINCT FROM is an operator token, not a
+    /// row-source introducer. Call with a quote/comment-masked source.
+    pub(crate) fn is_distinct_from_keyword(source: &str, position: usize) -> bool {
+        let Some(before) = source.get(..position) else {
+            return false;
+        };
+        let mut words = before.split_whitespace().rev();
+        if !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("DISTINCT"))
+        {
+            return false;
+        }
+        match words.next() {
+            Some(word) if word.eq_ignore_ascii_case("IS") => true,
+            Some(word) if word.eq_ignore_ascii_case("NOT") => words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("IS")),
+            _ => false,
+        }
+    }
     pub(super) fn is_keyword_at(source_upper: &str, start: usize, keyword: &str) -> bool {
         let end = start + keyword.len();
         if end > source_upper.len() {
@@ -39,7 +60,10 @@ impl SqlParser {
         let mut search_pos = from;
         while let Some(relative_pos) = source_upper[search_pos..].find(keyword) {
             let absolute_pos = search_pos + relative_pos;
-            if Self::is_keyword_at(source_upper, absolute_pos, keyword) {
+            if Self::is_keyword_at(source_upper, absolute_pos, keyword)
+                && !(keyword == "FROM"
+                    && Self::is_distinct_from_keyword(source_upper, absolute_pos))
+            {
                 return Some(absolute_pos);
             }
             search_pos = absolute_pos + keyword.len();
@@ -70,6 +94,12 @@ impl SqlParser {
     // directions use the same continuation and parenthesis rules.
     pub(super) fn statement_boundary(source: &str, after: Option<usize>) -> usize {
         let masked = Self::mask_sql_noise(source);
+        Self::statement_boundary_in_searchable(&masked, after)
+    }
+
+    /// The caller already owns the byte-preserving noise mask. Re-masking it
+    /// adds no information and is costly on every alias/navigation request.
+    pub(super) fn statement_boundary_in_searchable(masked: &str, after: Option<usize>) -> usize {
         let prefix = &masked[..after.unwrap_or(masked.len()).min(masked.len())];
         let semicolon_start = prefix.rfind(';').map(|position| position + 1).unwrap_or(0);
         let Some(segment) = masked.get(semicolon_start..) else {
@@ -127,7 +157,7 @@ impl SqlParser {
         }
 
         if after.is_some() {
-            source.len()
+            masked.len()
         } else {
             candidate_start.unwrap_or(semicolon_start)
         }

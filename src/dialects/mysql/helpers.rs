@@ -6,8 +6,18 @@ use crate::schema::{Function, Schema};
 use tower_lsp::lsp_types::{CompletionItem, Position};
 
 impl MysqlDialect {
+    pub(crate) fn sqlite() -> Self {
+        Self {
+            value_profile: "sqlite",
+            parser: std::sync::Mutex::new(
+                SqlParser::new_with_placeholder_dialect(SqlPlaceholderDialect::Mysql)
+                    .with_sqlite_joins(),
+            ),
+        }
+    }
     pub fn new() -> Self {
         Self {
+            value_profile: "mysql",
             parser: std::sync::Mutex::new(SqlParser::new_with_placeholder_dialect(
                 SqlPlaceholderDialect::Mysql,
             )),
@@ -59,8 +69,9 @@ impl MysqlDialect {
         tree: &tree_sitter::Tree,
         sql: &str,
         position: Position,
+        schema: &Schema,
     ) -> Vec<String> {
-        common::referenced_table_names_at_position(parser, tree, sql, position)
+        common::referenced_table_names_at_position(parser, tree, sql, position, schema)
     }
 
     pub(super) fn find_function_by_reference<'a>(

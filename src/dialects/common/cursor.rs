@@ -1,12 +1,21 @@
 use crate::parser::SqlParser;
+use crate::placeholder::SqlPlaceholderDialect;
 use tower_lsp::lsp_types::Position;
 
 pub(crate) fn cursor_prefix(sql: &str, position: Position) -> String {
+    cursor_prefix_for_dialect(SqlPlaceholderDialect::Generic, sql, position)
+}
+
+pub(crate) fn cursor_prefix_for_dialect(
+    dialect: SqlPlaceholderDialect,
+    sql: &str,
+    position: Position,
+) -> String {
     let lines: Vec<&str> = sql.lines().collect();
     let line_text = lines.get(position.line as usize).unwrap_or(&"");
     let text_before = &line_text[..position.character.min(line_text.len() as u32) as usize];
 
-    let token = cursor_identifier_token(text_before);
+    let token = SqlParser::identifier_path_token_for_dialect(text_before, dialect).unwrap_or("");
 
     if token.trim_end().ends_with('.') {
         return String::new();
@@ -20,7 +29,21 @@ pub(crate) fn cursor_prefix_excluding_keywords(
     position: Position,
     keywords: &[&str],
 ) -> String {
-    let prefix = cursor_prefix(sql, position);
+    cursor_prefix_excluding_keywords_for_dialect(
+        SqlPlaceholderDialect::Generic,
+        sql,
+        position,
+        keywords,
+    )
+}
+
+pub(crate) fn cursor_prefix_excluding_keywords_for_dialect(
+    dialect: SqlPlaceholderDialect,
+    sql: &str,
+    position: Position,
+    keywords: &[&str],
+) -> String {
+    let prefix = cursor_prefix_for_dialect(dialect, sql, position);
     if keywords
         .iter()
         .any(|keyword| prefix.eq_ignore_ascii_case(keyword))
@@ -249,7 +272,7 @@ pub(crate) fn predicate_continuation_keywords(
     let statement_start = SqlParser::active_statement_start(&text_before);
     let statement = &text_before[statement_start..];
 
-    let latest_clause = ["WHERE", "HAVING", "ON", "WHEN", "SET", "UPDATE"]
+    let latest_clause = ["WHERE", "HAVING", "ON", "WHEN", "SET", "UPDATE", "QUALIFY"]
         .into_iter()
         .filter_map(|clause| {
             previous_keyword_position(statement, clause).map(|position| (position, clause))
@@ -269,6 +292,7 @@ pub(crate) fn predicate_continuation_keywords(
         Some((_, "SET")) => vec![",", "WHERE"],
         Some((_, "UPDATE")) => vec![","],
         Some((_, "HAVING")) => vec!["AND", "OR", "ORDER BY", "LIMIT"],
+        Some((_, "QUALIFY")) => vec!["AND", "OR", "ORDER BY", "LIMIT"],
         Some((_, "ON")) => vec!["AND", "OR", "WHERE", "GROUP BY", "ORDER BY", "LIMIT"],
         Some((_, "WHEN")) => vec!["AND", "OR", "THEN"],
         Some((_, "WHERE")) => vec!["AND", "OR", "GROUP BY", "HAVING", "ORDER BY", "LIMIT"],
@@ -399,42 +423,14 @@ fn normalize_order_token(token: &str) -> String {
 }
 
 pub(crate) fn cursor_identifier_token(text_before: &str) -> &str {
-    let mut token_start = 0;
-    let mut quote_end: Option<char> = None;
-    let mut chars = text_before.char_indices().peekable();
-
-    while let Some((index, ch)) = chars.next() {
-        if let Some(end_quote) = quote_end {
-            if ch == end_quote {
-                if chars.peek().is_some_and(|(_, next)| *next == end_quote) {
-                    chars.next();
-                    continue;
-                }
-                quote_end = None;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' | '\'' | '`' => quote_end = Some(ch),
-            '[' => quote_end = Some(']'),
-            _ if ch.is_whitespace() || ch == ',' || ch == '(' => {
-                token_start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    &text_before[token_start..]
+    SqlParser::identifier_path_token_before_cursor(text_before).unwrap_or("")
 }
 
 pub(crate) fn text_before_position(sql: &str, position: Position) -> &str {
-    let lines: Vec<&str> = sql.lines().collect();
     let mut offset = 0usize;
-
-    for (line_index, line_text) in lines.iter().enumerate() {
+    for (line_index, line_text) in sql.split_inclusive('\n').enumerate() {
         if line_index < position.line as usize {
-            offset += line_text.len() + 1;
+            offset += line_text.len();
         } else if line_index == position.line as usize {
             offset += position.character.min(line_text.len() as u32) as usize;
             break;

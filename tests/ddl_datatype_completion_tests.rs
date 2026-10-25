@@ -15,6 +15,8 @@ fn column(name: &str) -> Column {
 fn schema(database: &str) -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: database.to_string(),
         server_version: None,

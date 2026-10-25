@@ -45,6 +45,8 @@ fn test_schema_manager_basic() {
 
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "test_db".to_string(),
         server_version: None,
@@ -70,6 +72,8 @@ fn test_schema_manager_multiple_schemas() {
 
     let schema1 = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "db1".to_string(),
         server_version: None,
@@ -86,6 +90,8 @@ fn test_schema_manager_multiple_schemas() {
 
     let schema2 = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "db2".to_string(),
         server_version: None,
@@ -123,6 +129,8 @@ async fn test_schema_manager_concurrent() {
         let handle = task::spawn(async move {
             let schema = Schema {
                 id: SchemaId::new(),
+                server: None,
+                namespace: None,
                 catalog: None,
                 database: format!("db_{}", i),
                 server_version: None,
@@ -148,6 +156,8 @@ async fn test_schema_manager_concurrent() {
 fn test_schema_with_tables_and_columns() {
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "test_db".to_string(),
         server_version: None,
@@ -188,6 +198,8 @@ fn test_schema_with_tables_and_columns() {
 fn test_schema_with_functions() {
     let schema = Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "test_db".to_string(),
         server_version: None,
@@ -196,6 +208,7 @@ fn test_schema_with_functions() {
             name: "my_function".to_string(),
             routine_type: Some("function".to_string()),
             parameters: vec![FunctionParameter {
+                mode: None,
                 name: "param1".to_string(),
                 data_type: "INT".to_string(),
                 optional: false,
@@ -217,6 +230,7 @@ fn test_procedure_documentation_uses_routine_type() {
         name: "rebuild_cache".to_string(),
         routine_type: Some("procedure".to_string()),
         parameters: vec![FunctionParameter {
+            mode: None,
             name: "tenant_id".to_string(),
             data_type: "integer".to_string(),
             optional: false,
@@ -238,11 +252,13 @@ fn optional_parameters_are_visible_in_signature_labels() {
         routine_type: Some("function".to_string()),
         parameters: vec![
             FunctionParameter {
+                mode: None,
                 name: "value".to_string(),
                 data_type: "numeric".to_string(),
                 optional: false,
             },
             FunctionParameter {
+                mode: None,
                 name: "precision".to_string(),
                 data_type: "integer".to_string(),
                 optional: true,

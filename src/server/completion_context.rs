@@ -3,9 +3,64 @@ use crate::parser::SqlParser;
 use crate::position::lsp_position_at_end;
 use std::collections::HashSet;
 use tower_lsp::lsp_types::*;
+
+#[derive(Default)]
+pub(super) struct CompletionCandidates {
+    pub(super) items: Vec<CompletionItem>,
+    pub(super) is_incomplete: bool,
+    pub(super) value_type: Option<String>,
+    pub(super) value_role: Option<&'static str>,
+    pub(super) logical_continuation: Option<bool>,
+    pub(super) pattern_escape: Option<bool>,
+    pub(super) constraints: Option<super::completion_constraints::CompletionKeywordConstraints>,
+}
+impl From<Vec<CompletionItem>> for CompletionCandidates {
+    fn from(items: Vec<CompletionItem>) -> Self {
+        Self {
+            items,
+            is_incomplete: false,
+            constraints: None,
+            value_type: None,
+            value_role: None,
+            logical_continuation: None,
+            pattern_escape: None,
+        }
+    }
+}
+pub(super) fn type_profile(profile: &str) -> Option<&str> {
+    Some(match profile {
+        "postgres" | "postgresql" | "pgsql" | "psql" => "postgres",
+        "sqlserver" | "mssql" | "tsql" => "sqlserver",
+        "sqlite" | "sqlite3" => "sqlite",
+        "hive" | "hql" => "hive",
+        "clickhouse" | "ch" => "clickhouse",
+        "mysql" | "mariadb" | "duckdb" => profile,
+        _ => return None,
+    })
+}
 pub(super) fn position_to_byte_offset(text: &str, position: Position) -> usize {
-    let (line_start, line_end) = line_bounds_for_position(text, position.line);
-    line_start + utf16_position_to_line_byte_offset(&text[line_start..line_end], position.character)
+    let line_start = line_start_for_position(text, position.line);
+    line_start + utf16_position_to_line_byte_offset(&text[line_start..], position.character)
+}
+
+/// A snapshot's position is a binding, so it cannot use a clamped cursor.
+/// Count only the requested line prefix and reject half-surrogate positions.
+pub(super) fn checked_position_to_byte_offset(text: &str, position: Position) -> Option<usize> {
+    let start = checked_line_start_for_position(text, position.line)?;
+    let mut units = 0;
+    for (relative, ch) in text[start..].char_indices() {
+        if units == position.character {
+            return Some(start + relative);
+        }
+        if matches!(ch, '\r' | '\n') {
+            return None;
+        }
+        units += ch.len_utf16() as u32;
+        if units > position.character {
+            return None;
+        }
+    }
+    (units == position.character).then_some(text.len())
 }
 
 /// Recover a high-confidence active statement for completion when users keep
@@ -31,7 +86,11 @@ pub(super) fn completion_statement_prefix(
     Some((scoped, lsp_position_at_end(scoped)))
 }
 
-pub(super) fn line_bounds_for_position(text: &str, target_line: u32) -> (usize, usize) {
+fn line_start_for_position(text: &str, target_line: u32) -> usize {
+    checked_line_start_for_position(text, target_line).unwrap_or(text.len())
+}
+
+fn checked_line_start_for_position(text: &str, target_line: u32) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut current_line = 0u32;
     let mut line_start = 0usize;
@@ -57,9 +116,13 @@ pub(super) fn line_bounds_for_position(text: &str, target_line: u32) -> (usize, 
     }
 
     if current_line < target_line {
-        return (text.len(), text.len());
+        return None;
     }
-
+    Some(line_start)
+}
+pub(super) fn line_bounds_for_position(text: &str, target_line: u32) -> (usize, usize) {
+    let line_start = line_start_for_position(text, target_line);
+    let bytes = text.as_bytes();
     let mut line_end = line_start;
     while line_end < bytes.len() && !matches!(bytes[line_end], b'\n' | b'\r') {
         line_end += 1;
@@ -73,7 +136,7 @@ pub(super) fn utf16_position_to_line_byte_offset(line: &str, character: u32) -> 
     let mut current_units = 0usize;
 
     for (byte_index, ch) in line.char_indices() {
-        if current_units >= target_units {
+        if current_units >= target_units || matches!(ch, '\r' | '\n') {
             return byte_index;
         }
 

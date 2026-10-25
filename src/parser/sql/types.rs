@@ -107,11 +107,67 @@ pub struct RelationAlias {
     pub relation: String,
 }
 
+/// Row sources in one visible query block, ordered from the cursor outward.
+#[derive(Debug, Clone)]
+pub struct RelationScope {
+    pub start: usize,
+    pub relations: Vec<String>,
+    pub aliases: Vec<RelationAlias>,
+    /// AST-known row occurrences, retaining an unaliased source alongside an
+    /// alias of that same table. None keeps legacy text-recovery bindings.
+    pub occurrences: Option<Vec<(String, Option<RelationAlias>)>>,
+    pub joined: Option<Box<JoinExpr>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+/// Source-owned layout only. Catalog lookup and output types belong to the
+/// shared row binder, so parser scopes never guess a table's shape.
+#[derive(Clone, Debug)]
+pub enum JoinExpr {
+    Empty,
+    /// A recognized layout exceeded the request budget. Do not fall back to
+    /// catalog names or a partial list of the recognized inputs.
+    Unknown,
+    Relation {
+        reference: String,
+        alias: Option<RelationAlias>,
+        range: std::ops::Range<usize>,
+        local: bool,
+    },
+    Group {
+        input: Box<JoinExpr>,
+        alias: Option<RelationAlias>,
+        columns: Vec<String>,
+        range: std::ops::Range<usize>,
+    },
+    Join {
+        left: Box<JoinExpr>,
+        right: Box<JoinExpr>,
+        kind: JoinKind,
+        keys: Vec<String>,
+        natural: bool,
+        predicate: Option<std::ops::Range<usize>>,
+    },
+}
+
 /// SQL 解析器（基于 Tree-sitter）
 pub struct SqlParser {
     pub(super) parser: Parser,
     pub(super) source: String, // 存储当前解析的 SQL 文本
+    pub(super) source_positions: Option<crate::position::SourcePositions>,
+    pub(super) syntax_tree: Option<Tree>,
+    #[cfg(test)]
+    pub(super) syntax_parse_count: usize,
     pub(super) placeholder_dialect: SqlPlaceholderDialect,
+    pub(super) sqlite_join_scopes: bool,
 }
 
 impl Default for SqlParser {

@@ -1,5 +1,5 @@
+use super::normalization::normalize_for_parser;
 use super::types::{ParseResult, SqlParser};
-use crate::placeholder::normalize_sql_placeholders_for_dialect;
 use crate::placeholder::SqlPlaceholderDialect;
 use crate::token::Delimiters;
 use crate::token::Keywords;
@@ -74,7 +74,7 @@ impl SqlParser {
     }
 
     pub(crate) fn new_with_placeholder_dialect(dialect: SqlPlaceholderDialect) -> Self {
-        let language = tree_sitter::Language::from(tree_sitter_sequel::LANGUAGE);
+        let language = crate::sql_grammar::language();
         let mut parser = Parser::new();
         parser
             .set_language(&language)
@@ -83,16 +83,18 @@ impl SqlParser {
         Self {
             parser,
             source: String::new(),
+            source_positions: None,
+            syntax_tree: None,
+            #[cfg(test)]
+            syntax_parse_count: 0,
             placeholder_dialect: dialect,
+            sqlite_join_scopes: false,
         }
     }
 
     /// 解析 SQL 语句
     pub fn parse(&mut self, sql: &str) -> ParseResult {
-        // 存储 source 以便后续使用
-        self.source = sql.to_string();
-        let normalized_sql = normalize_sql_placeholders_for_dialect(sql, self.placeholder_dialect);
-        let tree = self.parser.parse(&normalized_sql, None);
+        let tree = self.parse_syntax_tree(sql);
 
         let mut diagnostics = Vec::new();
 
@@ -138,13 +140,16 @@ impl SqlParser {
         previous_source: &str,
         previous_tree: &Tree,
     ) -> ParseResult {
-        self.source = sql.to_string();
-        let normalized_sql = normalize_sql_placeholders_for_dialect(sql, self.placeholder_dialect);
-        let previous_normalized =
-            normalize_sql_placeholders_for_dialect(previous_source, self.placeholder_dialect);
+        let normalized_sql = normalize_for_parser(sql, self.placeholder_dialect);
+        let previous_normalized = normalize_for_parser(previous_source, self.placeholder_dialect);
         let mut edited_tree = previous_tree.clone();
         edited_tree.edit(&minimal_input_edit(&previous_normalized, &normalized_sql));
+        #[cfg(test)]
+        {
+            self.syntax_parse_count += 1;
+        }
         let tree = self.parser.parse(&normalized_sql, Some(&edited_tree));
+        self.remember_syntax_tree(sql, tree.as_ref());
         let mut diagnostics = Vec::new();
         if let Some(tree) = &tree {
             self.collect_errors(tree.root_node(), sql, &mut diagnostics);
@@ -179,8 +184,215 @@ impl SqlParser {
         source: &str,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
+        super::tsql_modules::validate(self, node, source, diagnostics);
+        if node.kind() == "join"
+            && node
+                .named_children(&mut node.walk())
+                .any(|n| n.kind() == "keyword_natural")
+        {
+            // Recovery can interpret USING(id) as the right input's alias and
+            // alias-column list. It is still an illegal NATURAL condition.
+            if let Some(alias) = node
+                .named_children(&mut node.walk())
+                .find(|n| n.kind() == "relation")
+                .and_then(|n| n.child_by_field_name("alias"))
+                .filter(|a| source[a.byte_range()].eq_ignore_ascii_case("USING"))
+            {
+                diagnostics.push(Diagnostic {
+                    range: self.node_range(alias),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: Some(NumberOrString::String(
+                        "INVALID_NATURAL_JOIN_CONDITION".into(),
+                    )),
+                    source: Some("sql-dialect".into()),
+                    message: "NATURAL JOIN cannot have an explicit ON or USING condition".into(),
+                    ..Default::default()
+                });
+            }
+        }
+        if self.placeholder_dialect == SqlPlaceholderDialect::SqlServer
+            && node.kind() == "identifier"
+        {
+            let raw = &source[node.byte_range()];
+            if raw.starts_with('@')
+                && !raw.starts_with("@@")
+                && !crate::tsql_identifier::is_complete_name(raw)
+            {
+                diagnostics.push(Diagnostic {range:self.node_range(node),severity:Some(DiagnosticSeverity::ERROR),
+                    code:Some(NumberOrString::String("INVALID_TSQL_VARIABLE".into())),source:Some("sql-dialect".into()),
+                    message:"T-SQL local names require @ plus BMP letters/digits or _@$#, within 128 UTF-16 units".into(),..Default::default()});
+            }
+        }
+        if node.kind() == "tsql_declaration" {
+            let prohibited = node.child_by_field_name("type").is_some_and(|ty| {
+                ["text", "ntext", "image"]
+                    .iter()
+                    .any(|name| source[ty.byte_range()].eq_ignore_ascii_case(name))
+            });
+            let array = node
+                .named_children(&mut node.walk())
+                .any(|child| child.kind() == "array_size_definition");
+            if prohibited || array {
+                diagnostics.push(Diagnostic {
+                range:self.node_range(node),severity:Some(DiagnosticSeverity::ERROR),
+                code:Some(NumberOrString::String("INVALID_TSQL_VARIABLE_TYPE".into())),source:Some("sql-dialect".into()),
+                message:"SQL Server local variables do not support text/ntext/image or array declarations".into(),..Default::default()
+            });
+            }
+        }
+        if node.kind() == "tsql_declaration"
+            && node.child_by_field_name("name").is_some_and(|name| {
+                let raw = &source[name.byte_range()];
+                !raw.starts_with('@') || raw.starts_with("@@")
+            })
+        {
+            diagnostics.push(Diagnostic {
+                range: self.node_range(node),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("INVALID_TSQL_VARIABLE".into())),
+                source: Some("sql-dialect".into()),
+                message: "T-SQL local variable declarations require an @name".into(),
+                ..Default::default()
+            });
+        }
+        if node.kind() == "execute_argument" || node.kind() == "execute_statement" {
+            let bad_name = node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("return_status"))
+                .is_some_and(|name| {
+                    let raw = &source[name.byte_range()];
+                    !raw.starts_with('@') || raw.starts_with("@@")
+                });
+            let output = node
+                .named_children(&mut node.walk())
+                .any(|child| matches!(child.kind(), "keyword_out" | "keyword_output"));
+            let bad_output = output
+                && node.child_by_field_name("value").is_none_or(|value| {
+                    let raw = &source[value.byte_range()];
+                    value.kind() != "identifier" || !raw.starts_with('@') || raw.starts_with("@@")
+                });
+            if bad_name || bad_output {
+                diagnostics.push(Diagnostic {
+                    range: self.node_range(node),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: Some(NumberOrString::String("INVALID_EXECUTE_ARGUMENT".into())),
+                    source: Some("sql-dialect".into()),
+                    message: "EXEC parameter/return names and OUTPUT values must be @variables"
+                        .into(),
+                    ..Default::default()
+                });
+            }
+        }
+        if matches!(node.kind(), "execute_statement" | "tsql_declare_statement")
+            && self.placeholder_dialect != SqlPlaceholderDialect::SqlServer
+        {
+            diagnostics.push(Diagnostic {
+                range: self.node_range(node),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("UNSUPPORTED_DIALECT_SYNTAX".into())),
+                source: Some("sql-dialect".into()),
+                message: "Static EXEC/EXECUTE and local DECLARE require the SQL Server profile"
+                    .into(),
+                ..Default::default()
+            });
+        }
+        if node.kind() == "named_argument"
+            && matches!(
+                self.placeholder_dialect,
+                SqlPlaceholderDialect::Mysql | SqlPlaceholderDialect::SqlServer
+            )
+        {
+            diagnostics.push(Diagnostic {
+                range: self.node_range(node),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("UNSUPPORTED_DIALECT_SYNTAX".into())),
+                source: Some("sql-dialect".into()),
+                message: "Named =>/:= call arguments are not supported by this SQL profile".into(),
+                ..Default::default()
+            });
+        }
+        if node.kind() == "invocation" {
+            let mut variadic = None;
+            let mut count = 0;
+            for child in node.named_children(&mut node.walk()) {
+                if child.kind() == "keyword_variadic" {
+                    count += 1;
+                    variadic = Some(child);
+                }
+            }
+            if let Some(marker) = variadic {
+                let following = node
+                    .children_by_field_name("parameter", &mut node.walk())
+                    .filter(|parameter| parameter.start_byte() > marker.start_byte())
+                    .count();
+                if self.placeholder_dialect != SqlPlaceholderDialect::Postgres
+                    || count != 1
+                    || following != 1
+                {
+                    diagnostics.push(Diagnostic {
+                        range: self.node_range(node),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: Some(NumberOrString::String("UNSUPPORTED_DIALECT_SYNTAX".into())),
+                        source: Some("sql-dialect".into()),
+                        message: "VARIADIC is supported only on the last PostgreSQL call argument"
+                            .into(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if self.placeholder_dialect == SqlPlaceholderDialect::Postgres
+            && Self::unsupported_postgres_array_constructor(node)
+        {
+            diagnostics.push(Diagnostic {
+                range: self.node_range(node),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("UNSUPPORTED_DIALECT_SYNTAX".into())),
+                source: Some("sql-dialect".into()),
+                message: "PostgreSQL requires ARRAY[...] or ARRAY(query)".into(),
+                ..Default::default()
+            });
+        }
+        if self.placeholder_dialect != SqlPlaceholderDialect::Postgres
+            && Self::is_postfix_array_cast(node)
+        {
+            diagnostics.push(Diagnostic {
+                range: self.node_range(node),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("UNSUPPORTED_DIALECT_SYNTAX".into())),
+                source: Some("sql-dialect".into()),
+                message: "Postfix array casts require the PostgreSQL dialect".into(),
+                ..Default::default()
+            });
+        }
+        // The grammar can consume a bare FROM as the entire SELECT field,
+        // hiding the missing projection instead of producing an ERROR node.
+        if node.kind() == "field"
+            && node
+                .utf8_text(source.as_bytes())
+                .is_ok_and(|text| text.eq_ignore_ascii_case("FROM"))
+            && node
+                .parent()
+                .and_then(|parent| parent.parent())
+                .is_some_and(|parent| parent.kind() == "select_expression")
+        {
+            diagnostics.push(Diagnostic {
+                range: self.node_range(node),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("PARSE_ERROR".into())),
+                source: Some("tree-sitter-sql".into()),
+                message: "Expected a SELECT expression before FROM".into(),
+                ..Default::default()
+            });
+        }
+        // Tree-sitter can hide a missing _identifier under a zero-width
+        // identifier leaf: has_error is true but is_missing is false there.
+        let missing = node.is_missing()
+            || (node.has_error()
+                && node.child_count() == 0
+                && node.start_byte() == node.end_byte());
         // 检查是否是错误节点
-        if node.is_error() || node.is_missing() {
+        if node.is_error() || missing {
             let start_byte = node.start_byte();
             let end_byte = node.end_byte();
             let start_point = node.start_position();
@@ -206,7 +418,7 @@ impl SqlParser {
             }
 
             // 2. 过滤空白字符错误（格式问题，不是语法错误）
-            if node_text.trim().is_empty() && !node.is_missing() {
+            if node_text.trim().is_empty() && !missing {
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     self.collect_errors(child, source, diagnostics);
@@ -454,8 +666,8 @@ impl SqlParser {
         let node_kind = node.kind();
         let start_point = node.start_position();
 
-        if let Ok(text) = node.utf8_text(source.as_bytes()) {
-            let text = text.trim();
+        {
+            let text = Self::source_node_text(node, source).trim();
             if !text.is_empty() {
                 let token_type = self.classify_token(node_kind, text);
                 let position = Self::tree_sitter_point_to_lsp_position(source, start_point);
@@ -675,16 +887,44 @@ impl SqlParser {
 
     /// 获取节点的文本内容
     pub fn node_text(&self, node: Node, source: &str) -> String {
-        node.utf8_text(source.as_bytes()).unwrap_or("").to_string()
+        Self::source_node_text(node, source).to_string()
     }
 
     /// 获取节点的范围
     pub fn node_range(&self, node: Node) -> Range {
         let start = node.start_position();
         let end = node.end_position();
+        let position = |point: Point| {
+            self.source_positions.as_ref().map_or_else(
+                || Self::tree_sitter_point_to_lsp_position(&self.source, point),
+                |index| {
+                    index.position(
+                        &self.source,
+                        Position {
+                            line: point.row as u32,
+                            character: point.column as u32,
+                        },
+                    )
+                },
+            )
+        };
+        let offset = |at| {
+            self.source_positions.as_ref().map_or_else(
+                || crate::position::lsp_position_at_end(&self.source[..at]),
+                |index| index.offset(&self.source, at),
+            )
+        };
+        let end = if node.kind() == "keyword_cast" {
+            Self::try_cast_name_range(node, &self.source).map(|(_, end)| offset(end))
+        } else {
+            Self::apply_keyword_range(node, &self.source)
+                .or_else(|| Self::search_operator_range(node, &self.source))
+                .map(|(_, end)| offset(end))
+        }
+        .unwrap_or_else(|| position(end));
         Range {
-            start: Self::tree_sitter_point_to_lsp_position(&self.source, start),
-            end: Self::tree_sitter_point_to_lsp_position(&self.source, end),
+            start: position(start),
+            end,
         }
     }
 }

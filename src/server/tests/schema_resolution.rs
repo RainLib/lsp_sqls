@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::schema_resolution::schema_table_matches;
 
 #[test]
 fn schema_match_score_requires_exact_table_matches() {
@@ -205,7 +206,7 @@ fn extracts_schema_qualifier_at_completion_position() {
             },
         )
         .as_deref(),
-        Some("App Schema")
+        Some(r#""App Schema""#)
     );
 }
 
@@ -240,10 +241,18 @@ fn finds_catalog_qualified_schema_without_cross_catalog_leakage() {
     let manager = SchemaManager::new();
     let mut app = test_schema("dbo", &["users"]);
     app.catalog = Some("AppDb".to_string());
+    app.namespace = Some(
+        serde_json::from_value(serde_json::json!({"default_schema":"dbo","tables_complete":true}))
+            .unwrap(),
+    );
     let app_id = manager.register(app);
     let mut audit = test_schema("dbo", &["users"]);
     audit.catalog = Some("AuditDb".to_string());
-    let audit_id = manager.register(audit);
+    let audit_id = manager.register(audit.clone());
+    let mut remote = audit;
+    remote.id = SchemaId::new();
+    remote.server = Some("ServerOne".into());
+    let remote_id = manager.register(remote);
 
     assert_eq!(
         find_schema_by_qualifier(&manager, "AppDb.dbo").map(|schema| schema.id),
@@ -252,13 +261,17 @@ fn finds_catalog_qualified_schema_without_cross_catalog_leakage() {
     assert_eq!(
         find_schema_by_table_reference(&manager, "[ServerOne].[AuditDb].[dbo].[users]")
             .map(|schema| schema.id),
-        Some(audit_id)
+        Some(remote_id)
     );
     assert_eq!(
         find_schema_by_table_reference(&manager, "AppDb..users").map(|schema| schema.id),
         Some(app_id)
     );
     assert!(find_schema_by_qualifier(&manager, "dbo").is_none());
+    assert_eq!(
+        find_schema_by_qualifier(&manager, "AuditDb.dbo").map(|schema| schema.id),
+        Some(audit_id)
+    );
     assert!(find_schema_by_table_reference(&manager, "dbo.users").is_none());
 }
 
@@ -324,4 +337,32 @@ fn resolves_mixed_case_unquoted_aliases_for_column_schema_selection() {
         .map(|schema| schema.id),
         Some(audit_id)
     );
+}
+
+#[test]
+fn quoted_catalog_and_schema_dots_are_literal_metadata() {
+    let manager = SchemaManager::new();
+    let mut expected = test_schema("app.name", &["odd.table"]);
+    expected.catalog = Some("prod.region".into());
+    manager.register(expected);
+    let schema = find_schema_by_qualifier(&manager, r#""prod.region"."app.name""#).unwrap();
+    assert_eq!(schema.database, "app.name");
+    assert!(find_schema_by_qualifier(&manager, "prod.region.app.name").is_none());
+    assert_eq!(
+        find_schema_by_qualifier(&manager, r#""app.name""#)
+            .unwrap()
+            .database,
+        "app.name"
+    );
+    assert!(find_schema_by_qualifier(&manager, "app.name").is_none());
+    assert!(schema_table_matches(
+        &schema,
+        r#""prod.region"."app.name"."odd.table""#,
+        &schema.tables[0]
+    ));
+    assert!(!schema_table_matches(
+        &schema,
+        "prod.region.app.name.odd.table",
+        &schema.tables[0]
+    ));
 }

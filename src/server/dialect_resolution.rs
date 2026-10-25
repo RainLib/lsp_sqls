@@ -35,16 +35,25 @@ pub(super) fn infer_dialect_from_uri_and_language(
         || uri_lower.ends_with(".psql")
     {
         return "postgres".to_string();
+    } else if [
+        ".sqlserver.sql",
+        ".sqlserver",
+        ".mssql.sql",
+        ".mssql",
+        ".tsql.sql",
+        ".tsql",
+    ]
+    .iter()
+    .any(|suffix| uri_lower.ends_with(suffix))
+    {
+        return "sqlserver".to_string();
     } else if uri_lower.ends_with(".sqlite.sql")
         || uri_lower.ends_with(".sqlite")
         || uri_lower.ends_with(".sqlite3")
-        // DuckDB currently opts into the shipped SQLite-compatible completion
-        // profile. Recognize its URI extension too, so a document never falls
-        // back to the previously selected connection while config sync runs.
-        || uri_lower.ends_with(".duckdb.sql")
-        || uri_lower.ends_with(".duckdb")
     {
         return "sqlite".to_string();
+    } else if uri_lower.ends_with(".duckdb.sql") || uri_lower.ends_with(".duckdb") {
+        return "duckdb".to_string();
     } else if uri_lower.ends_with(".hive.sql") || uri_lower.ends_with(".hql") {
         return "hive".to_string();
     } else if let Some(dialect) = product_sql_file_suffix_dialect(&uri_lower) {
@@ -73,7 +82,9 @@ pub(super) fn infer_dialect_from_uri_and_language(
     match lang_lower.as_str() {
         "mysql" | "mysql-sql" => "mysql".to_string(),
         "postgresql" | "postgres" | "postgres-sql" | "pgsql" | "psql" => "postgres".to_string(),
-        "sqlite" | "sqlite3" | "duckdb" => "sqlite".to_string(),
+        "sqlserver" | "mssql" | "tsql" | "transact-sql" => "sqlserver".to_string(),
+        "sqlite" | "sqlite3" => "sqlite".to_string(),
+        "duckdb" => "duckdb".to_string(),
         "hive" | "hql" => "hive".to_string(),
         "elasticsearch-eql" | "eql" => "elasticsearch-eql".to_string(),
         "elasticsearch-dsl" | "es-dsl" | "json" if uri_lower.contains("elasticsearch") => {

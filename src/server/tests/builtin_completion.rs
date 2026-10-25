@@ -101,7 +101,7 @@ fn clickhouse_dbx_catalog_supports_aliases_combinators_and_table_functions() {
 
     let relation_sql = "SELECT * FROM num";
     let mut relation_items = Vec::new();
-    add_clickhouse_table_function_completions(
+    add_builtin_table_function_completions(
         relation_sql,
         lsp_position_at_end(relation_sql),
         "clickhouse",
@@ -322,6 +322,7 @@ fn oracle_relation_blocks_and_table_routine_context_align_dbx() {
             name: "fetch_rows".to_string(),
             routine_type: Some("function".to_string()),
             parameters: vec![FunctionParameter {
+                mode: None,
                 name: "limit".to_string(),
                 data_type: "NUMBER".to_string(),
                 optional: false,
