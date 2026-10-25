@@ -107,7 +107,7 @@ pub(crate) fn apply_formatter_layout(
     if logical_operator_layout != LogicalOperatorLayout::Before {
         let mut rewritten_lines = Vec::with_capacity(lines.len());
         let mut rewritten_masked_lines = Vec::with_capacity(masked_lines.len());
-        for (current, masked_line) in lines.into_iter().zip(masked_lines.into_iter()) {
+        for (current, masked_line) in lines.into_iter().zip(masked_lines) {
             let leading = masked_line.len() - masked_line.trim_start().len();
             let trimmed_upper = masked_line[leading..].to_ascii_uppercase();
             let operator_len = ["AND", "OR", "XOR"]

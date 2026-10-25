@@ -334,11 +334,7 @@ fn cte_tables_before_cursor(
         if recursive {
             cursor = skip_sql_trivia(source, cursor + "RECURSIVE".len());
         }
-        loop {
-            let Some((name, name_start, name_end)) = read_local_identifier_after(source, cursor)
-            else {
-                break;
-            };
+        while let Some((name, name_start, name_end)) = read_local_identifier_after(source, cursor) {
             cursor = skip_sql_trivia(source, name_end);
             let mut explicit_columns = Vec::new();
             if source[cursor..].starts_with('(') {

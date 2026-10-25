@@ -37,6 +37,10 @@ impl CompletionSnapshot {
 /// SQL 方言抽象 trait
 /// 所有 SQL 方言都需要实现这个 trait
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods that already return must-use futures"
+)]
 pub trait Dialect: Send + Sync {
     /// 方言名称
     fn name(&self) -> &str;
