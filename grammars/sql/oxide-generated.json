@@ -1,0 +1,19 @@
+{
+  "generator": "tree-sitter-cli@0.26.3",
+  "abi": 14,
+  "normalization": "UTF-8 text, BOM stripped, CRLF normalized to LF",
+  "files": {
+    "grammar.js": "d3dfaab41606ed470859869c51415a55a99831c6f2f22158da6c07753dc861c7",
+    "src/parser.c": "7e207ebc0108c00d10380adc1a279085f93c94fc86126bb77e29301720e8fe8f",
+    "src/node-types.json": "0aa64555bb847bb43351d6fb21698f229253a29a91a8d24e8d2611608aeaef48",
+    "src/grammar.json": "5f5ad8e6fcd18f14c4a1fa7eb8525fab96e23fc0fd72d28ee20e2bdbc37039e1",
+    "src/tree_sitter/parser.h": "180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2",
+    "src/tree_sitter/alloc.h": "b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea",
+    "src/tree_sitter/array.h": "5bdf6ed1a78e3409fd443e085ca967a64c188a5d082aaf7f819bccd53a471c94",
+    "src/scanner.c": "de17b5cffc3c86f56cf6630abb969330c3c839a81ece0b901bdac0ecee93c403",
+    "bindings/rust/lib.rs": "d6cf7aaf5738e4c8c795cb532800815899184502f030744dfd3d7f417bdc12af",
+    "bindings/rust/build.rs": "e77395b9ddee352b6cd32e36ddc655615e267b2d9bda1a93ffb927974c5c1c0a",
+    "LICENSE": "3b3e4e4252d5d7d1c18e1257005f23242bf0580ad619204fd093c99b8c56748d",
+    "Cargo.upstream.toml": "5430fe42d679a558ac016cce1bb107ce4c75de926bf2be4d7ee6c28422f157cf"
+  }
+}

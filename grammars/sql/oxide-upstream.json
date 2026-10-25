@@ -1,0 +1,11 @@
+{
+  "crate": "tree-sitter-sequel",
+  "version": "0.3.11",
+  "crateSha256": "9d198ad3c319c02e43c21efa1ec796b837afcb96ffaef1a40c1978fbdcec7d17",
+  "vcsReportedCommit": "7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8",
+  "vcsReportedDirty": true,
+  "generator": "tree-sitter-cli@0.26.3",
+  "abi": 14,
+  "upstreamGrammarSha256": "6b1f0554a355d8fe3b341ef25c7236cf4b433f85b632e39ade62931b78de16bc",
+  "patchedGrammarSha256": "d3dfaab41606ed470859869c51415a55a99831c6f2f22158da6c07753dc861c7"
+}

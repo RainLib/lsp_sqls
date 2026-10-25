@@ -3,8 +3,8 @@ use super::items::{
     create_function_item, create_index_item, create_table_item, set_completion_sort_text,
 };
 use super::references::{find_table_by_reference, table_is_referenced, table_matches};
-use crate::parser::{RelationAlias, SqlParser};
-use crate::schema::{Constraint, Schema};
+use crate::parser::RelationAlias;
+use crate::schema::{Constraint, Schema, Table};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Documentation, InsertTextFormat};
@@ -14,12 +14,29 @@ pub(crate) fn add_schema_tables(
     schema: &Schema,
     prefix: &str,
     qualify_with_database: bool,
+    qualified_only: bool,
 ) {
+    let local_names: HashSet<_> = schema
+        .tables
+        .iter()
+        .filter(|table| crate::relation_bindings::query_local(table))
+        .map(|table| table.name.to_ascii_lowercase())
+        .collect();
     for table in &schema.tables {
-        if !prefix.is_empty() && !table.name.to_lowercase().starts_with(prefix) {
+        let local = crate::relation_bindings::query_local(table);
+        let shadowed = !crate::relation_bindings::local(table)
+            && local_names.contains(&table.name.to_ascii_lowercase());
+        if (local && qualified_only) || (shadowed && schema.database.is_empty()) {
             continue;
         }
-        items.push(create_table_item(table, schema, qualify_with_database));
+        if identifier_match_rank(&table.name, prefix).is_none() {
+            continue;
+        }
+        items.push(create_table_item(
+            table,
+            schema,
+            !local && (qualify_with_database || shadowed),
+        ));
     }
 }
 
@@ -34,6 +51,7 @@ pub(crate) fn add_foreign_key_join_snippets(
     let referenced = referenced_tables
         .iter()
         .filter_map(|reference| find_table_by_reference(schema, reference))
+        .filter(|table| !crate::relation_bindings::local(table))
         .collect::<Vec<_>>();
     if referenced.is_empty() {
         return;
@@ -44,14 +62,26 @@ pub(crate) fn add_foreign_key_join_snippets(
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
 
+    let local_names: HashSet<_> = schema
+        .tables
+        .iter()
+        .filter(|table| crate::relation_bindings::query_local(table))
+        .map(|table| table.name.to_ascii_lowercase())
+        .collect();
     for candidate in &schema.tables {
+        if crate::relation_bindings::local(candidate) {
+            continue;
+        }
         if table_is_referenced(schema, candidate, referenced_tables)
             || identifier_match_rank(&candidate.name, prefix).is_none()
         {
             continue;
         }
         let candidate_alias = available_table_alias(&candidate.name, &used_aliases);
-        let relation = if qualify_with_database && !schema.database.is_empty() {
+        let relation = if (qualify_with_database
+            || local_names.contains(&candidate.name.to_ascii_lowercase()))
+            && !schema.database.is_empty()
+        {
             format!("{}.{}", schema.database, candidate.name)
         } else {
             candidate.name.clone()
@@ -67,10 +97,7 @@ pub(crate) fn add_foreign_key_join_snippets(
 
             for constraint in &candidate.constraints {
                 if !is_foreign_key(constraint)
-                    || constraint
-                        .referenced_table
-                        .as_deref()
-                        .is_none_or(|table| !table_matches(schema, existing, table))
+                    || !constraint_targets_table(schema, existing, constraint)
                 {
                     continue;
                 }
@@ -88,10 +115,7 @@ pub(crate) fn add_foreign_key_join_snippets(
 
             for constraint in &existing.constraints {
                 if !is_foreign_key(constraint)
-                    || constraint
-                        .referenced_table
-                        .as_deref()
-                        .is_none_or(|table| !table_matches(schema, candidate, table))
+                    || !constraint_targets_table(schema, candidate, constraint)
                 {
                     continue;
                 }
@@ -108,6 +132,20 @@ pub(crate) fn add_foreign_key_join_snippets(
             }
         }
     }
+}
+
+fn constraint_targets_table(schema: &Schema, table: &Table, constraint: &Constraint) -> bool {
+    !crate::relation_bindings::local(table)
+        && constraint
+            .referenced_schema
+            .as_ref()
+            .is_none_or(|namespace| namespace.eq_ignore_ascii_case(&schema.database))
+        && constraint
+            .referenced_table
+            .as_deref()
+            .is_some_and(|reference| {
+                crate::relation_bindings::catalog_table_matches(schema, table, reference)
+            })
 }
 
 fn is_foreign_key(constraint: &Constraint) -> bool {
@@ -240,11 +278,13 @@ pub(crate) fn add_schema_columns(
             .unwrap_or(table_order);
 
         for column in &table.columns {
-            let Some(match_rank) = identifier_match_rank(&column.name, prefix) else {
+            let Some(match_rank) = crate::identifier_search::column_match_rank(column, prefix)
+            else {
                 continue;
             };
             let source_key = format!(
-                "{}\u{0}{}\u{0}{}",
+                "{}\u{0}{}\u{0}{}\u{0}{}",
+                crate::relation_bindings::query_local(table),
                 schema.database.to_ascii_lowercase(),
                 table.name.to_ascii_lowercase(),
                 column.name.to_ascii_lowercase()
@@ -269,6 +309,11 @@ pub(crate) fn add_schema_columns(
                 .as_deref()
                 .map(|catalog| format!("{catalog}.{}", schema.database))
                 .unwrap_or_else(|| schema.database.clone());
+            let namespace = schema
+                .server
+                .as_deref()
+                .map(|server| format!("{server}.{namespace}"))
+                .unwrap_or(namespace);
             item.detail = Some(format!(
                 "Column: {}.{}.{} ({}){}",
                 namespace,
@@ -280,12 +325,17 @@ pub(crate) fn add_schema_columns(
             item.data = Some(json!({
                 "oxide": {
                     "kind": "column",
+                    "queryLocal": crate::relation_bindings::query_local(table),
                     "catalog": schema.catalog,
                     "schema": schema.database,
                     "table": table.name,
                     "column": column.name,
+                    "searchComment": column.comment.as_deref().map(crate::identifier_search::comment_prefix),
                 }
             }));
+            if let Some(server) = &schema.server {
+                item.data.as_mut().unwrap()["oxide"]["server"] = json!(server);
+            }
             item.sort_text = Some(format!(
                 "{}:{:01}:{:02}:{:04}:{}:{}",
                 sort_prefix,
@@ -321,6 +371,9 @@ pub(crate) fn identifier_match_rank(candidate: &str, prefix: &str) -> Option<u8>
     let abbreviation = identifier_abbreviation(candidate);
     if abbreviation.starts_with(&prefix_lower) {
         return Some(2);
+    }
+    if let Some(rank) = crate::identifier_search::pinyin_rank(candidate, &prefix_lower) {
+        return Some(rank);
     }
     is_subsequence(&prefix_lower, &candidate_lower).then_some(3)
 }
@@ -367,6 +420,19 @@ pub(crate) fn apply_column_aliases(
         return;
     }
 
+    let tables: HashMap<_, _> = schema
+        .tables
+        .iter()
+        .map(|table| {
+            (
+                (
+                    table.name.as_str(),
+                    crate::relation_bindings::query_local(table),
+                ),
+                table,
+            )
+        })
+        .collect();
     let mut expanded = Vec::with_capacity(items.len());
     for item in items.drain(..) {
         let Some(source) = completion_column_source(&item) else {
@@ -376,16 +442,25 @@ pub(crate) fn apply_column_aliases(
         let matching_aliases = aliases
             .iter()
             .filter(|alias| {
-                SqlParser::table_name_matches_with_catalog(
-                    &alias.relation,
-                    source.catalog.as_deref(),
-                    &source.schema,
-                    &source.table,
-                ) && source
-                    .catalog
-                    .as_deref()
-                    .unwrap_or_default()
-                    .eq_ignore_ascii_case(schema.catalog.as_deref().unwrap_or_default())
+                tables
+                    .get(&(source.table.as_str(), source.query_local))
+                    .is_some_and(|table| {
+                        table_matches(
+                            schema,
+                            table,
+                            super::references::row_reference(schema, aliases, &alias.sql),
+                        )
+                    })
+                    && source
+                        .server
+                        .as_deref()
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case(schema.server.as_deref().unwrap_or_default())
+                    && source
+                        .catalog
+                        .as_deref()
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case(schema.catalog.as_deref().unwrap_or_default())
                     && source.schema.eq_ignore_ascii_case(&schema.database)
             })
             .cloned()
@@ -419,6 +494,8 @@ pub(crate) fn apply_column_aliases(
 }
 
 struct CompletionColumnSource {
+    server: Option<String>,
+    query_local: bool,
     catalog: Option<String>,
     schema: String,
     table: String,
@@ -431,6 +508,14 @@ fn completion_column_source(item: &CompletionItem) -> Option<CompletionColumnSou
         return None;
     }
     Some(CompletionColumnSource {
+        server: source
+            .get("server")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        query_local: source
+            .get("queryLocal")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         catalog: source
             .get("catalog")
             .and_then(|catalog| catalog.as_str())

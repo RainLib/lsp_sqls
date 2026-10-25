@@ -1,64 +1,109 @@
-//! Routine hints for the SQL language server.
+//! Routine hints share qualified identity and dialect-aware lexical masks.
 use super::completion_context::position_to_byte_offset;
 use super::document_structure::position_for_offset;
-use super::semantic_tokens::sql_identifier_tokens;
-use super::sql_scan::skip_sql_whitespace;
-use crate::schema::Schema;
+use super::limits::SIGNATURE_HELP_MAX_SCAN_BYTES;
+use super::routine_arguments::complete_arguments_in_masks;
+use super::routine_identity::{routine_reference_before, RoutineIdentity};
+use super::routine_parameters::{routine_kind_matches, RoutineParameters};
+use crate::parser::SqlParser;
+use crate::schema::{Schema, SchemaManager};
 use std::collections::HashSet;
 use tower_lsp::lsp_types::*;
-pub(super) fn routine_parameter_hints(text: &str, range: Range, schema: &Schema) -> Vec<InlayHint> {
+
+enum Arguments {
+    Parenthesized(usize),
+    Execute(super::routine_arguments::RoutineArguments),
+}
+
+pub(super) fn routine_parameter_hints(
+    text: &str,
+    range: Range,
+    schema: &Schema,
+    manager: &SchemaManager,
+    dialect: &str,
+) -> Vec<InlayHint> {
     let range_start = position_to_byte_offset(text, range.start);
     let range_end = position_to_byte_offset(text, range.end);
+    let masked = SqlParser::mask_sql_noise_for_dialect(text, dialect);
+    let content = SqlParser::mask_sql_operand_context_for_dialect(text, dialect);
     let mut hints = Vec::new();
-
-    for (identifier, _, name_end) in sql_identifier_tokens(text) {
-        let mut opening = name_end;
-        while text[opening..]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-        {
-            let Some(character) = text[opening..].chars().next() else {
-                break;
-            };
-            opening += character.len_utf8();
+    let calls = masked.char_indices().filter_map(|(opening, character)| {
+        if character != '(' || opening > range_end {
+            return None;
         }
-        if !text[opening..].starts_with('(') {
+        let mut start = opening.saturating_sub(SIGNATURE_HELP_MAX_SCAN_BYTES);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let (reference, procedure) = routine_reference_before(
+            &text[start..opening],
+            &content[start..opening],
+            opening - start,
+            dialect,
+        )?;
+        Some((reference, procedure, Arguments::Parenthesized(opening)))
+    });
+    let execute =
+        super::execute_context::calls_in_masks(text, &masked, &content, range_end, dialect)
+            .map(|call| (call.name, true, Arguments::Execute(call.supplied)));
+    for (reference, procedure, arguments) in calls.chain(execute) {
+        let Some(identity) = RoutineIdentity::parse(&reference, dialect) else {
             continue;
-        }
-        let overloads = schema
+        };
+        let Some(metadata) = identity.schema(Some(schema), manager, dialect) else {
+            continue;
+        };
+        let overloads = metadata
             .functions
             .iter()
-            .filter(|function| function.name.eq_ignore_ascii_case(&identifier))
+            .filter(|function| {
+                identity.matches(function, dialect) && routine_kind_matches(function, procedure)
+            })
             .collect::<Vec<_>>();
         if overloads.is_empty() {
             continue;
         }
-        let Some(arguments) = routine_argument_offsets(text, opening) else {
-            continue;
+        // Unknown calls never pay for argument-list extraction. Both call
+        // forms are streamed and reuse this request's lexical masks.
+        let arguments = match arguments {
+            Arguments::Parenthesized(opening) => {
+                let Some(arguments) =
+                    complete_arguments_in_masks(text, &masked, &content, opening, dialect)
+                else {
+                    continue;
+                };
+                arguments
+            }
+            Arguments::Execute(arguments) => arguments,
         };
+        let explicit = arguments.values.iter().any(|argument| argument.explicit);
         let matching_overloads = overloads
             .into_iter()
-            .filter(|function| {
-                let required = function
-                    .parameters
-                    .iter()
-                    .filter(|parameter| !parameter.optional)
-                    .count();
-                required <= arguments.len() && arguments.len() <= function.parameters.len()
+            .map(|function| RoutineParameters::new(function, dialect, procedure))
+            .filter_map(|parameters| {
+                let binding = arguments.bind(&parameters, dialect);
+                binding.fits.then_some((parameters, binding))
             })
             .collect::<Vec<_>>();
         if matching_overloads.is_empty() {
             continue;
         }
-
-        for (parameter_index, argument_start) in arguments.into_iter().enumerate() {
+        for (parameter_index, argument) in arguments.values.iter().enumerate() {
+            if argument.name.is_some() {
+                continue;
+            }
+            let argument_start = argument.full.start
+                + content[argument.full.clone()]
+                    .find(|ch: char| !ch.is_whitespace())
+                    .unwrap_or(argument.full.len());
             if argument_start < range_start || argument_start > range_end {
                 continue;
             }
             let names = matching_overloads
                 .iter()
-                .filter_map(|function| function.parameters.get(parameter_index))
+                .filter_map(|(parameters, binding)| {
+                    parameters.parameter(binding.slots.get(parameter_index).copied().flatten()?)
+                })
                 .map(|parameter| parameter.name.trim())
                 .filter(|name| !name.is_empty())
                 .collect::<HashSet<_>>();
@@ -66,16 +111,22 @@ pub(super) fn routine_parameter_hints(text: &str, range: Range, schema: &Schema)
                 continue;
             }
             let name = *names.iter().next().expect("one parameter name");
-            let argument_tail = &text[argument_start..];
-            if argument_tail.strip_prefix(name).is_some_and(|tail| {
-                tail.trim_start().starts_with("=>") || tail.trim_start().starts_with(":=")
-            }) {
+            if text[argument_start..]
+                .strip_prefix(name)
+                .is_some_and(|tail| {
+                    tail.trim_start().starts_with("=>") || tail.trim_start().starts_with(":=")
+                })
+            {
                 continue;
             }
             let data_types = matching_overloads
                 .iter()
-                .filter_map(|function| function.parameters.get(parameter_index))
-                .map(|parameter| parameter.data_type.trim())
+                .filter_map(|(parameters, binding)| {
+                    parameters.data_type(
+                        binding.slots.get(parameter_index).copied().flatten()?,
+                        explicit,
+                    )
+                })
                 .filter(|data_type| !data_type.is_empty())
                 .collect::<HashSet<_>>();
             let tooltip = (data_types.len() == 1).then(|| {
@@ -95,56 +146,11 @@ pub(super) fn routine_parameter_hints(text: &str, range: Range, schema: &Schema)
                 data: None,
             });
         }
+        if hints.len() >= 500 {
+            break;
+        }
     }
     hints.sort_by_key(|hint| (hint.position.line, hint.position.character));
     hints.truncate(500);
     hints
-}
-
-pub(super) fn routine_argument_offsets(text: &str, opening: usize) -> Option<Vec<usize>> {
-    let mut arguments = Vec::new();
-    let mut nesting = 0u32;
-    let mut quote = None;
-    let mut argument_start = opening + 1;
-    let mut saw_content = false;
-
-    for (relative, character) in text[opening + 1..].char_indices() {
-        let offset = opening + 1 + relative;
-        if let Some(active_quote) = quote {
-            if character == active_quote {
-                quote = None;
-            }
-            saw_content = true;
-            continue;
-        }
-        if matches!(character, '\'' | '"' | '`') {
-            quote = Some(character);
-            saw_content = true;
-            continue;
-        }
-        match character {
-            '(' | '[' | '{' => {
-                nesting += 1;
-                saw_content = true;
-            }
-            ')' if nesting == 0 => {
-                if saw_content {
-                    arguments.push(skip_sql_whitespace(text, argument_start, offset));
-                }
-                return Some(arguments);
-            }
-            ')' | ']' | '}' if nesting > 0 => {
-                nesting -= 1;
-                saw_content = true;
-            }
-            ',' if nesting == 0 => {
-                arguments.push(skip_sql_whitespace(text, argument_start, offset));
-                argument_start = offset + character.len_utf8();
-                saw_content = false;
-            }
-            _ if !character.is_whitespace() => saw_content = true,
-            _ => {}
-        }
-    }
-    None
 }

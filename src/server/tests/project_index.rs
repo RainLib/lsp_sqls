@@ -64,7 +64,7 @@ fn project_sql_index_preserves_quoted_names_and_utf16_selection_ranges() {
     let sql = "SELECT 'emoji 馃榾', * FROM [AppDb]..[orders]";
     let occurrence = project_sql_symbol_occurrences(sql)
         .into_iter()
-        .find(|occurrence| occurrence.normalized_name == "appdb.dbo.orders")
+        .find(|occurrence| occurrence.normalized_name == "appdb..orders")
         .expect("SQL Server relation should be indexed");
     let orders_start = sql.find("orders").unwrap();
 

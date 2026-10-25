@@ -7,6 +7,7 @@ use tower_lsp::lsp_types::{CompletionItem, Diagnostic, Hover, Location, Position
 
 pub struct MysqlDialect {
     pub(super) parser: std::sync::Mutex<SqlParser>,
+    pub(super) value_profile: &'static str,
 }
 
 impl Default for MysqlDialect {
@@ -25,11 +26,16 @@ impl Dialect for MysqlDialect {
         "mysql"
     }
 
-    async fn parse(&self, sql: &str, _schema: Option<&Schema>) -> Vec<Diagnostic> {
-        // 使用 Tree-sitter 进行容错 SQL 解析
-        let mut parser = self.parser.lock().unwrap();
-        let parse_result = parser.parse(sql);
-        parse_result.diagnostics
+    async fn parse(&self, sql: &str, schema: Option<&Schema>) -> Vec<Diagnostic> {
+        self.parse_with_syntax(sql, schema).await.diagnostics
+    }
+
+    async fn parse_with_syntax(
+        &self,
+        sql: &str,
+        _schema: Option<&Schema>,
+    ) -> crate::parser::ParseResult {
+        self.parser.lock().unwrap().parse(sql)
     }
 
     async fn completion(
@@ -38,6 +44,16 @@ impl Dialect for MysqlDialect {
         position: Position,
         schema: Option<&Schema>,
     ) -> Vec<CompletionItem> {
+        completion::completion(self, sql, position, schema).items
+    }
+
+    async fn completion_with_scope(
+        &self,
+        sql: &str,
+        position: Position,
+        schema: Option<&Schema>,
+        _context: Option<&tower_lsp::lsp_types::CompletionContext>,
+    ) -> crate::dialect::CompletionSnapshot {
         completion::completion(self, sql, position, schema)
     }
 
@@ -82,7 +98,8 @@ impl Dialect for MysqlDialect {
                 // 如果是表名，查找表定义
                 if is_table {
                     if let Some(schema) = schema {
-                        let table_ref = SqlParser::normalize_identifier(&node_text);
+                        let relation = crate::dialects::common::relation_reference_node(node);
+                        let table_ref = parser.node_text(relation, sql);
                         if let Some(table) = Self::find_table_by_reference(schema, &table_ref) {
                             // 使用表的源位置（如果有）
                             let (uri, line) = if let Some((ref source_uri, source_line)) =

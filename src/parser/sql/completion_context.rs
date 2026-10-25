@@ -12,6 +12,13 @@ impl SqlParser {
         source: &str,
         position: Position,
     ) -> CompletionContext {
+        if let Some(context) =
+            Self::qualified_member_context(source, position, self.placeholder_dialect)
+        {
+            return context;
+        }
+        let scoped = Self::completion_context_source(source, position);
+        let source = scoped.as_ref();
         if Self::expression_value_context_at_position(source, position) {
             return CompletionContext::ExpressionValueClause;
         }
@@ -46,6 +53,12 @@ impl SqlParser {
 
         if let Some(context) = Self::analyze_completed_keyword_context(source, position) {
             return context;
+        }
+
+        if Self::qualify_query_range(source, Self::byte_offset_for_position(source, position))
+            .is_some()
+        {
+            return CompletionContext::WhereClause;
         }
 
         if Self::join_using_column_context_at_position(source, position) {
@@ -124,6 +137,18 @@ impl SqlParser {
         // Usually we want to find the clause we are in (SELECT, FROM, WHERE, etc.)
         while let Some(n) = current_node {
             match n.kind() {
+                "join"
+                    if n.child_by_field_name("predicate").is_some_and(|predicate| {
+                        let cursor = Self::byte_offset_for_position(source, position);
+                        n.named_children(&mut n.walk())
+                            .find(|n| n.kind() == "keyword_on")
+                            .is_some_and(|on| on.end_byte() <= cursor)
+                            && cursor <= predicate.end_byte()
+                    }) =>
+                {
+                    return CompletionContext::WhereClause
+                }
+                "subquery" => break,
                 // SELECT clause
                 "select_clause" | "select_list" => {
                     // Check if we are in a column position or after a dot
@@ -180,7 +205,7 @@ impl SqlParser {
         self.analyze_completion_context_fallback(source, position)
     }
 
-    pub(super) fn byte_offset_for_position(source: &str, position: Position) -> usize {
+    pub(crate) fn byte_offset_for_position(source: &str, position: Position) -> usize {
         // Dialect entry points convert LSP UTF-16 positions to tree-sitter byte
         // columns exactly once. Parser context helpers must not reinterpret the
         // byte column as UTF-16, especially after emoji or non-ASCII literals.
@@ -302,6 +327,11 @@ impl SqlParser {
         source: &str,
         position: Position,
     ) -> CompletionContext {
+        if let Some(context) =
+            Self::qualified_member_context(source, position, self.placeholder_dialect)
+        {
+            return context;
+        }
         Self::completion_context_from_text(source, position)
     }
 
@@ -309,6 +339,15 @@ impl SqlParser {
     /// Callers that already paid for dialect parsing can use this without
     /// constructing a second tree-sitter parser on the typing hot path.
     pub fn completion_context_from_text(source: &str, position: Position) -> CompletionContext {
+        if let Some(context) = Self::qualified_member_context(
+            source,
+            position,
+            crate::placeholder::SqlPlaceholderDialect::Generic,
+        ) {
+            return context;
+        }
+        let scoped = Self::completion_context_source(source, position);
+        let source = scoped.as_ref();
         let cursor_offset = Self::byte_offset_for_position(source, position);
         // Extract text before cursor
         let text_before = if cursor_offset <= source.len() {
@@ -322,6 +361,7 @@ impl SqlParser {
         let statement_start = Self::previous_statement_start(&text_upper, text_upper.len());
         let statement_upper = &text_upper[statement_start..];
         let raw_statement_upper = &raw_text_upper[statement_start..];
+        let words = Self::statement_words(statement_upper);
 
         // Priority 1: Check for table/alias column access (ends with .)
         if text_before.trim_end().ends_with('.') {
@@ -427,6 +467,9 @@ impl SqlParser {
             return CompletionContext::CaseWhenValueContinuationClause;
         }
 
+        if Self::words_end_with(&words, &["WHEN"]) {
+            return CompletionContext::WhereClause;
+        }
         if Self::is_case_result_context(raw_statement_upper) {
             return CompletionContext::CaseResultClause;
         }
@@ -451,6 +494,11 @@ impl SqlParser {
             return CompletionContext::FromClause;
         }
 
+        // The AST path already recognizes these completed condition markers.
+        // Keep the text fallback consistent without rescanning its noise mask.
+        if Self::words_end_with(&words, &["ON"]) {
+            return CompletionContext::WhereClause;
+        }
         if Self::is_relation_target_context(statement_upper) {
             return CompletionContext::FromClause;
         }

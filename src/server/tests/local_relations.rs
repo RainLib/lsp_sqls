@@ -12,6 +12,7 @@ fn local_relation_augmentation_extracts_dbx_cte_and_derived_projection_shapes() 
         sql,
         lsp_position_at_end(sql),
         "oxide://query/semantic.postgres.sql",
+        Some("postgres"),
     );
 
     let recent = augmented
@@ -57,6 +58,7 @@ fn local_relation_scan_ignores_keywords_inside_comments_and_literals() {
         sql,
         lsp_position_at_end(sql),
         "oxide://query/noise.postgres.sql",
+        Some("postgres"),
     );
 
     assert!(!augmented.tables.iter().any(|table| table.name == "ghost"));
@@ -72,6 +74,7 @@ fn local_relation_scan_is_bounded_for_large_console_documents() {
         &sql,
         lsp_position_at_end(&sql),
         "oxide://query/large.postgres.sql",
+        Some("postgres"),
     );
 
     assert!(!augmented.tables.iter().any(|table| table.name == "recent"));
@@ -94,7 +97,7 @@ fn local_relation_augmentation_models_dbx_correlation_column_shapes() {
             ),
             (
                 "SELECT * FROM users u(user_id) WHERE u.",
-                "users",
+                "u",
                 vec!["user_id", "name", "email"],
                 "CORRELATED TABLE",
             ),
@@ -130,6 +133,7 @@ fn local_relation_augmentation_models_dbx_correlation_column_shapes() {
             sql,
             lsp_position_at_end(sql),
             "oxide://query/correlation.postgres.sql",
+            Some("postgres"),
         );
         let table = augmented
             .tables
@@ -159,6 +163,7 @@ fn sqlserver_table_hints_preserve_remote_column_shapes() {
             sql,
             lsp_position_at_end(sql),
             "oxide://query/hints.sqlserver.sql",
+            Some("postgres"),
         );
         let users = augmented
             .tables
@@ -187,6 +192,7 @@ async fn dbx_cte_column_scope_is_shared_by_native_and_compatibility_dialects() {
         sql,
         position,
         "oxide://query/cte.postgres.sql",
+        Some("postgres"),
     );
     let registry = DialectRegistry::new();
 

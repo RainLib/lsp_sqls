@@ -1,18 +1,19 @@
 //! Runtime for the SQL language server.
 use super::builtin_completion::{
-    add_builtin_function_completions, add_clickhouse_table_function_completions,
-    add_oracle_table_function_completions, add_window_function_completions,
+    add_builtin_table_function_completions, add_expression_routine_completions,
+    add_oracle_table_function_completions,
 };
 use super::completion_case::apply_completion_preferences;
 use super::completion_context::{
     apply_completed_sql_context_completion_edits, apply_high_frequency_keyword_ranking,
     completion_statement_prefix, deduplicate_simple_completion_items, position_to_byte_offset,
+    CompletionCandidates,
 };
 use super::completion_identifiers::{
     add_referenced_alias_completions, apply_qualified_identifier_completion_edits,
 };
 use super::completion_resolve::CompletionResolveCache;
-use super::diagnostics::document_diagnostics;
+use super::diagnostics::document_diagnostics_with_metadata;
 use super::dialect_resolution::infer_dialect_from_uri_and_language;
 use super::documents::{CachedSqlAnalysis, DocumentManager};
 use super::inline_types::{
@@ -21,7 +22,7 @@ use super::inline_types::{
 };
 use super::insert_completion::{add_insert_all_columns_completion, add_insert_statement_snippets};
 use super::limits::{PROJECT_SQL_INDEX_MAX_DOCUMENTS, PROJECT_SQL_INDEX_MAX_RESULTS};
-use super::local_relations::augment_schema_with_local_relations;
+use super::local_relations::augment_schema_with_local_relations_and_routines;
 use super::locations::range_contains_position;
 use super::preferences::{
     dialect_uses_sql_preferences, CompletionPreferences, FormattingPreferences,
@@ -58,6 +59,7 @@ use tower_lsp::Client;
 /// SQL LSP 服务器
 pub struct SqlLspServer {
     pub(super) client: Client,
+    pub(super) analysis: super::analysis_state::AnalysisState,
     /// 方言注册表
     pub(super) dialect_registry: Arc<DialectRegistry>,
     /// Schema 管理器
@@ -90,6 +92,7 @@ impl SqlLspServer {
         tracing::info!("Creating new SQL LSP server instance");
         Self {
             client,
+            analysis: Default::default(),
             dialect_registry: Arc::new(DialectRegistry::new()),
             schema_manager: Arc::new(SchemaManager::new()),
             configured_file_dialects: Arc::new(DashMap::new()),
@@ -138,8 +141,8 @@ impl SqlLspServer {
 
     /// 获取文件的方言
     pub(super) fn get_dialect_for_file(&self, uri: &str) -> Option<Arc<dyn Dialect>> {
-        if let Some(dialect_name) = self.configured_file_dialects.get(uri) {
-            return self.dialect_registry.get_by_name(dialect_name.value());
+        if let Some(name) = self.configured_dialect_identity(uri) {
+            return self.dialect_registry.get_by_name(&name);
         }
 
         self.inferred_file_dialects
@@ -148,13 +151,22 @@ impl SqlLspServer {
     }
 
     pub(super) fn dialect_identity_for_file(&self, uri: &str) -> Option<String> {
+        self.configured_dialect_identity(uri).or_else(|| {
+            self.inferred_file_dialects
+                .get(uri)
+                .map(|dialect| dialect.value().clone())
+        })
+    }
+
+    fn configured_dialect_identity(&self, uri: &str) -> Option<String> {
         self.configured_file_dialects
             .get(uri)
-            .map(|dialect| dialect.value().clone())
+            .map(|value| value.clone())
             .or_else(|| {
-                self.inferred_file_dialects
-                    .get(uri)
-                    .map(|dialect| dialect.value().clone())
+                let source = super::auxiliary_documents::configured_source_uri(uri)?;
+                self.configured_file_dialects
+                    .get(&source)
+                    .map(|value| value.clone())
             })
     }
 
@@ -188,6 +200,8 @@ impl SqlLspServer {
         let has_metadata = schema.is_some();
         let schema = schema.unwrap_or_else(|| Schema {
             id: SchemaId(uuid::Uuid::nil()),
+            server: None,
+            namespace: None,
             catalog: None,
             database: String::new(),
             server_version: None,
@@ -195,7 +209,15 @@ impl SqlLspServer {
             functions: Vec::new(),
             source_uri: None,
         });
-        let schema = augment_schema_with_local_relations(schema, text, position, uri);
+        let dialect = self.dialect_identity_for_file(uri);
+        let schema = augment_schema_with_local_relations_and_routines(
+            schema,
+            text,
+            position,
+            uri,
+            dialect.as_deref(),
+            Some(&self.schema_manager),
+        );
         // Local projections remain useful while physical metadata is loading.
         // This ephemeral shape is never registered as a synchronized catalog.
         (has_metadata || !schema.tables.is_empty()).then_some(schema)
@@ -210,38 +232,16 @@ impl SqlLspServer {
         position_to_byte_offset(text, position)
     }
 
-    pub(super) async fn publish_diagnostics_for_open_documents(&self) {
-        for (uri, text) in self.document_manager.entries() {
-            let revision = self.document_manager.revision(&uri);
-            let version = self.document_manager.version(&uri);
-            let Ok(parsed_uri) = Url::parse(&uri) else {
-                tracing::warn!("Skipping diagnostics for invalid document URI: {}", uri);
-                continue;
-            };
-
-            if let Some(dialect) = self.get_dialect_for_file(&uri) {
-                let schema = self.get_schema_for_file(&uri);
-                let diagnostics = document_diagnostics(&*dialect, &text, schema.as_ref()).await;
-                // A configuration refresh can race with didChange. Never
-                // label diagnostics computed from the old snapshot with the
-                // newer document version.
-                if self.document_manager.revision(&uri) != revision {
-                    continue;
-                }
-                self.client
-                    .publish_diagnostics(parsed_uri, diagnostics, version)
-                    .await;
-            }
-        }
-    }
-
     pub(super) fn analysis_tree_for_document(
         &self,
         uri: &str,
         text: &str,
         dialect: &str,
     ) -> Option<tree_sitter::Tree> {
-        if !matches!(dialect, "postgres" | "mysql" | "clickhouse" | "hive") {
+        if !matches!(
+            dialect,
+            "postgres" | "mysql" | "clickhouse" | "hive" | "sqlserver"
+        ) {
             self.analysis_cache.remove(uri);
             return None;
         }
@@ -250,11 +250,7 @@ impl SqlLspServer {
                 return Some(cached.tree.clone());
             }
         }
-        let placeholder_dialect = match dialect {
-            "postgres" => SqlPlaceholderDialect::Postgres,
-            "mysql" => SqlPlaceholderDialect::Mysql,
-            _ => SqlPlaceholderDialect::Generic,
-        };
+        let placeholder_dialect = SqlPlaceholderDialect::for_name(Some(dialect));
         let mut parser = SqlParser::new_with_placeholder_dialect(placeholder_dialect);
         let result = if let Some(cached) = self.analysis_cache.get(uri) {
             parser.parse_incremental(text, &cached.source, &cached.tree)
@@ -496,36 +492,101 @@ impl SqlLspServer {
         text: &str,
         position: Position,
         context: Option<&CompletionContext>,
-    ) -> Option<Vec<CompletionItem>> {
+    ) -> Option<CompletionCandidates> {
         let dialect = self.get_dialect_for_file(uri)?;
+        let dialect_identity = self
+            .dialect_identity_for_file(uri)
+            .unwrap_or_else(|| dialect.name().to_string());
+        if dialect_uses_sql_preferences(dialect.name())
+            && super::completion_regions::in_literal_or_comment(text, position, &dialect_identity)
+        {
+            return Some(Vec::new().into());
+        }
+        if let Some(mut candidates) = super::is_predicate_completion::completion_candidates(
+            text,
+            position,
+            &dialect_identity,
+            || self.get_schema_for_position(uri, text, position),
+        ) {
+            let preferences = self
+                .completion_preferences
+                .read()
+                .map(|value| value.clone())
+                .unwrap_or_default();
+            apply_completion_preferences(text, position, &mut candidates.items, &preferences);
+            return Some(candidates);
+        }
+        if let Some(mut items) = super::execute_completion::completions(
+            text,
+            position,
+            &dialect_identity,
+            || self.get_schema_for_file(uri),
+            &self.schema_manager,
+        ) {
+            let preferences = self
+                .completion_preferences
+                .read()
+                .map(|p| p.clone())
+                .unwrap_or_default();
+            apply_completion_preferences(text, position, &mut items.items, &preferences);
+            return Some(items);
+        }
+        if let Some(items) = super::call_completion::completions(
+            text,
+            position,
+            &dialect_identity,
+            || self.get_schema_for_file(uri),
+            &self.schema_manager,
+        ) {
+            return Some(items);
+        }
+        if let Some(items) =
+            super::tsql_variable_completion::completions(text, position, &dialect_identity)
+        {
+            return Some(items);
+        }
         let schema = self.get_schema_for_position(uri, text, position);
         let (completion_text, completion_position) =
             completion_statement_prefix(text, position).unwrap_or((text, position));
-        let mut items = dialect
-            .completion_with_context(
+        let completion = dialect
+            .completion_with_scope(
                 completion_text,
                 completion_position,
                 schema.as_ref(),
                 context,
             )
             .await;
-        let dialect_identity = self
-            .dialect_identity_for_file(uri)
-            .unwrap_or_else(|| dialect.name().to_string());
-        add_builtin_function_completions(
-            completion_text,
-            completion_position,
+        let mut items = completion.items;
+        if let Some(server) = schema.as_ref().and_then(|schema| schema.server.as_ref()) {
+            for item in &mut items {
+                if item.kind == Some(CompletionItemKind::FIELD) {
+                    if let Some(source) = item.data.as_mut().and_then(|data| data.get_mut("oxide"))
+                    {
+                        if source.get("column").is_some() {
+                            source["server"] = serde_json::json!(server);
+                        }
+                    }
+                }
+            }
+        }
+        let qualify_incomplete = super::local_relations::add_qualify_completions(
+            text,
+            position,
+            &dialect_identity,
+            schema.as_ref(),
+            uri,
+            Some(&self.schema_manager),
+            &mut items,
+        );
+        add_expression_routine_completions(
+            text,
+            position,
             &dialect_identity,
             schema.as_ref(),
             &mut items,
+            Some((completion_text, completion_position)),
         );
-        add_window_function_completions(
-            completion_text,
-            completion_position,
-            &dialect_identity,
-            &mut items,
-        );
-        add_clickhouse_table_function_completions(
+        add_builtin_table_function_completions(
             completion_text,
             completion_position,
             &dialect_identity,
@@ -538,6 +599,28 @@ impl SqlLspServer {
             schema.as_ref(),
             &mut items,
         );
+        let expectation = super::comparison_value_types::enrich(
+            text,
+            position,
+            &dialect_identity,
+            schema.as_ref(),
+            &mut items,
+        );
+        let (value_type, value_role) =
+            expectation.map_or((None, None), |value| (Some(value.data_type), value.role));
+        let continuation = if value_type.is_none() {
+            super::logical_continuations::enrich(
+                text,
+                position,
+                &dialect_identity,
+                schema.as_ref(),
+                &mut items,
+            )
+        } else {
+            None
+        };
+        let logical_continuation = continuation.map(|knowledge| knowledge.logical);
+        let pattern_escape = continuation.and_then(|knowledge| knowledge.pattern_escape);
         let preferences = self
             .completion_preferences
             .read()
@@ -562,21 +645,69 @@ impl SqlLspServer {
                 dialect.name(),
             );
         }
-        add_referenced_alias_completions(text, position, &mut items);
+        add_referenced_alias_completions(
+            text,
+            position,
+            &mut items,
+            completion.relation_aliases.as_deref(),
+        );
         apply_completed_sql_context_completion_edits(text, position, &mut items);
+        if relational_completion {
+            let quote_dialect =
+                if matches!(dialect_identity.as_str(), "sqlserver" | "mssql" | "tsql") {
+                    "sqlserver"
+                } else {
+                    dialect.name()
+                };
+            super::completion_quotes::apply_column_identifier_edits(
+                text,
+                position,
+                quote_dialect,
+                &mut items,
+            );
+        }
         apply_qualified_identifier_completion_edits(text, position, &mut items);
         if relational_completion {
             apply_completion_preferences(text, position, &mut items, &preferences);
         }
         deduplicate_simple_completion_items(&mut items);
         apply_high_frequency_keyword_ranking(&mut items);
-        Some(items)
+        let named = super::named_completion::completions(
+            text,
+            position,
+            &dialect_identity,
+            || self.get_schema_for_file(uri),
+            &self.schema_manager,
+        );
+        items.extend(named.items);
+        let prefix = crate::dialects::common::cursor_prefix_for_dialect(
+            crate::placeholder::SqlPlaceholderDialect::for_name(Some(&dialect_identity)),
+            text,
+            crate::parser::SqlParser::lsp_position_to_byte_position(text, position),
+        );
+        let search_incomplete = if !relational_completion
+            || super::completion_context::COMPLETED_SQL_CONTEXT_KEYWORDS.contains(&prefix.as_str())
+        {
+            false
+        } else {
+            crate::identifier_search::rank_items(&mut items, &prefix)
+        };
+        Some(CompletionCandidates {
+            value_type,
+            value_role,
+            logical_continuation,
+            pattern_escape,
+            constraints: None,
+            items,
+            is_incomplete: named.is_incomplete || qualify_incomplete || search_incomplete,
+        })
     }
 
     pub async fn inline_completion_context(
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<InlineCompletionContextResponse> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let position = params.position;
         let text = self.document_manager.get(&uri).unwrap_or_default();
@@ -587,7 +718,8 @@ impl SqlLspServer {
         let mut raw_candidates = self
             .completion_candidates_at(&uri, &text, position, None)
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .items;
         raw_candidates.sort_by(|left, right| {
             left.sort_text
                 .as_deref()
@@ -604,7 +736,13 @@ impl SqlLspServer {
                 kind: item.kind.and_then(serialized_lsp_number),
             })
             .collect();
-        let raw_diagnostics = document_diagnostics(&*dialect, &text, schema.as_ref()).await;
+        let raw_diagnostics = document_diagnostics_with_metadata(
+            &*dialect,
+            &text,
+            schema.as_ref(),
+            Some(&self.schema_manager),
+        )
+        .await;
         let error_count = raw_diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
@@ -670,12 +808,19 @@ impl SqlLspServer {
         &self,
         params: InlineCompletionValidationParams,
     ) -> Result<Vec<Diagnostic>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let Some(dialect) = self.get_dialect_for_file(&uri) else {
             return Ok(Vec::new());
         };
         let schema = self.get_schema_for_file(&uri);
-        Ok(document_diagnostics(&*dialect, &params.text, schema.as_ref()).await)
+        Ok(document_diagnostics_with_metadata(
+            &*dialect,
+            &params.text,
+            schema.as_ref(),
+            Some(&self.schema_manager),
+        )
+        .await)
     }
 }
 

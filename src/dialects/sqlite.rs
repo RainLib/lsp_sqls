@@ -1,6 +1,5 @@
-//! SQLite shares the ANSI-style relation and column completion surface with
-//! PostgreSQL, but must retain its own dialect id so file mappings and schema
-//! metadata are never silently routed to a different configured database.
+//! Shared relational completion adapters for SQLite and DuckDB. Each keeps
+//! its own profile identity; their existing parser baselines stay distinct.
 
 use crate::dialect::Dialect;
 use crate::dialects::MysqlDialect;
@@ -19,6 +18,7 @@ use tower_lsp::lsp_types::{
 /// driver.
 pub struct SqliteDialect {
     relational: MysqlDialect,
+    profile: &'static str,
 }
 
 impl Default for SqliteDialect {
@@ -30,7 +30,17 @@ impl Default for SqliteDialect {
 impl SqliteDialect {
     pub fn new() -> Self {
         Self {
-            relational: MysqlDialect::new(),
+            relational: MysqlDialect::sqlite(),
+            profile: "sqlite",
+        }
+    }
+
+    pub(super) fn ansi() -> Self {
+        let mut relational = MysqlDialect::new();
+        relational.value_profile = "duckdb";
+        Self {
+            relational,
+            profile: "duckdb",
         }
     }
 }
@@ -38,7 +48,7 @@ impl SqliteDialect {
 #[async_trait]
 impl Dialect for SqliteDialect {
     fn name(&self) -> &str {
-        "sqlite"
+        self.profile
     }
 
     async fn parse(&self, sql: &str, schema: Option<&Schema>) -> Vec<Diagnostic> {
@@ -63,6 +73,18 @@ impl Dialect for SqliteDialect {
     ) -> Vec<CompletionItem> {
         self.relational
             .completion_with_context(sql, position, schema, context)
+            .await
+    }
+
+    async fn completion_with_scope(
+        &self,
+        sql: &str,
+        position: Position,
+        schema: Option<&Schema>,
+        context: Option<&LspCompletionContext>,
+    ) -> crate::dialect::CompletionSnapshot {
+        self.relational
+            .completion_with_scope(sql, position, schema, context)
             .await
     }
 

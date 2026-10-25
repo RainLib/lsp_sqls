@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["LikeRainDay"]
 description = "A high-performance, multi-dialect SQL Language Server Protocol (LSP) implementation in Rust."
-license = "MIT"
+license = "MIT AND Unicode-3.0"
 repository = "https://github.com/LikeRainDay/lsp_sqls"
 homepage = "https://github.com/LikeRainDay/lsp_sqls"
 readme = "README.md"
@@ -34,7 +34,7 @@ thiserror = "2.0"
 dashmap = "6.2"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 tree-sitter = "0.26.3"
-tree-sitter-sequel = "0.3.11"
+tree-sitter-language = "0.1"
 tree-sitter-json = "0.24"
 sqlparser = { version = "0.62", default-features = false, features = ["std"], optional = true }
 sqlformat = "0.5"
@@ -47,3 +47,7 @@ strict-parser = ["sqlparser"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+tower = { version = "0.4.13", default-features = false }
+
+[build-dependencies]
+cc = "~1.2.1"

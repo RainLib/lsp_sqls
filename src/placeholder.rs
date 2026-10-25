@@ -22,6 +22,18 @@ pub enum SqlPlaceholderDialect {
     Generic,
     Postgres,
     Mysql,
+    SqlServer,
+}
+
+impl SqlPlaceholderDialect {
+    pub(crate) fn for_name(name: Option<&str>) -> Self {
+        match name {
+            Some("postgres" | "postgresql" | "pgsql" | "psql") => Self::Postgres,
+            Some("mysql" | "mariadb") => Self::Mysql,
+            Some("sqlserver" | "mssql" | "tsql") => Self::SqlServer,
+            _ => Self::Generic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,8 +64,8 @@ pub fn normalize_sql_placeholders_for_dialect(
         normalized[span.start + 1..span.end].fill(b'_');
     }
 
-    // Every recognized placeholder is ASCII, so replacing it byte-for-byte
-    // cannot invalidate the source's existing UTF-8 encoding.
+    // Each complete span becomes ASCII bytes of the same length, including
+    // multibyte T-SQL names; untouched UTF-8 stays valid at both boundaries.
     String::from_utf8(normalized).expect("placeholder normalization preserves UTF-8")
 }
 
@@ -83,7 +95,7 @@ pub fn sql_placeholder_spans_for_dialect(
             break;
         };
 
-        if ch == '$' {
+        if ch == '$' && dialect != SqlPlaceholderDialect::SqlServer {
             if let Some(end) = skip_dollar_quoted_region(source, index) {
                 index = end;
                 continue;
@@ -91,7 +103,12 @@ pub fn sql_placeholder_spans_for_dialect(
         }
 
         if matches!(ch, '\'' | '"' | '`') {
-            index = skip_quoted_region(source, index, ch);
+            index = skip_quoted_region(
+                source,
+                index,
+                ch,
+                dialect != SqlPlaceholderDialect::SqlServer,
+            );
             continue;
         }
 
@@ -147,6 +164,9 @@ pub fn placeholder_at_for_dialect(
             }
         }
         b'?' => {
+            if start.checked_sub(1).and_then(|index| bytes.get(index)) == Some(&b'@') {
+                return None;
+            }
             if matches!(bytes.get(start + 1), Some(b'|' | b'&')) {
                 return None;
             }
@@ -163,14 +183,28 @@ pub fn placeholder_at_for_dialect(
                 SqlPlaceholderKind::QuestionMark,
             )
         }
-        b'@' if !previous_is_identifier && bytes.get(start + 1) != Some(&b'@') => (
-            named_parameter_end(bytes, start + 1)?,
-            SqlPlaceholderKind::AtName,
-        ),
-        b':' if !previous_is_identifier && bytes.get(start + 1) != Some(&b':') => (
-            named_parameter_end(bytes, start + 1)?,
-            SqlPlaceholderKind::ColonName,
-        ),
+        b'@' if !previous_is_identifier
+            && bytes.get(start + 1) != Some(&b'@')
+            && start.checked_sub(1).and_then(|index| bytes.get(index)) != Some(&b'@') =>
+        {
+            (
+                if dialect == SqlPlaceholderDialect::SqlServer {
+                    crate::tsql_identifier::variable_end(source, start)?
+                } else {
+                    named_parameter_end(bytes, start + 1)?
+                },
+                SqlPlaceholderKind::AtName,
+            )
+        }
+        b':' if !previous_is_identifier
+            && bytes.get(start + 1) != Some(&b':')
+            && start.checked_sub(1).and_then(|index| bytes.get(index)) != Some(&b':') =>
+        {
+            (
+                named_parameter_end(bytes, start + 1)?,
+                SqlPlaceholderKind::ColonName,
+            )
+        }
         b'{' if bytes.get(start + 1) == Some(&b'{') => (
             delimited_name_end(bytes, start + 2, b'}', Some(b'}'))?,
             SqlPlaceholderKind::Mustache,
@@ -281,7 +315,7 @@ fn postgres_operator_context_prefix(source: &str, end: usize) -> String {
             }
         }
         if matches!(ch, '\'' | '"' | '`') {
-            let next = skip_quoted_region(source, index, ch).min(end);
+            let next = skip_quoted_region(source, index, ch, true).min(end);
             push_context_mask(source, &mut output, index, next, true);
             index = next;
             continue;
@@ -378,8 +412,10 @@ fn is_template_name_continue(byte: &u8) -> bool {
 }
 
 fn starts_hash_comment(source: &str, index: usize, dialect: SqlPlaceholderDialect) -> bool {
-    dialect != SqlPlaceholderDialect::Postgres
-        && source[index..].starts_with('#')
+    !matches!(
+        dialect,
+        SqlPlaceholderDialect::Postgres | SqlPlaceholderDialect::SqlServer
+    ) && source[index..].starts_with('#')
         && !source[index..].starts_with("#>")
         && !source[index..].starts_with("#-")
         && (index == 0
@@ -426,7 +462,12 @@ fn skip_block_comment(source: &str, mut index: usize) -> usize {
     index
 }
 
-fn skip_quoted_region(source: &str, mut index: usize, quote: char) -> usize {
+fn skip_quoted_region(
+    source: &str,
+    mut index: usize,
+    quote: char,
+    backslash_escape: bool,
+) -> usize {
     index += quote.len_utf8();
     while index < source.len() {
         let Some(ch) = source[index..].chars().next() else {
@@ -434,7 +475,7 @@ fn skip_quoted_region(source: &str, mut index: usize, quote: char) -> usize {
         };
         index += ch.len_utf8();
 
-        if ch == '\\' && quote == '\'' && index < source.len() {
+        if backslash_escape && ch == '\\' && quote == '\'' && index < source.len() {
             if let Some(escaped) = source[index..].chars().next() {
                 index += escaped.len_utf8();
             }
@@ -593,5 +634,43 @@ SELECT :outside;
         assert_eq!(normalized.len(), sql.len());
         assert_eq!(normalized.matches('\n').count(), sql.matches('\n').count());
         assert_eq!(&normalized[.."SELECT '😀', ".len()], "SELECT '😀', ");
+    }
+    #[test]
+    fn postfix_cast_colons_are_not_bind_parameters() {
+        let sql = "SELECT u.id::bigint, (1)::numeric(12,2), :bind::integer[], $1::text, '::literal', NULL::\"User Type\" FROM users u";
+        for dialect in [
+            SqlPlaceholderDialect::Generic,
+            SqlPlaceholderDialect::Postgres,
+            SqlPlaceholderDialect::Mysql,
+        ] {
+            let spans = sql_placeholder_spans_for_dialect(sql, dialect);
+            let values: Vec<_> = spans
+                .iter()
+                .map(|span| &sql[span.start..span.end])
+                .collect();
+            assert_eq!(values, [":bind", "$1"], "{dialect:?}");
+            let normalized = normalize_sql_placeholders_for_dialect(sql, dialect);
+            assert!(normalized.contains("u.id::bigint"));
+            assert!(normalized.contains("(1)::numeric(12,2)"));
+            assert!(normalized.contains("::integer[]"));
+            assert!(normalized.contains("::text"));
+            assert_eq!(normalized.len(), sql.len());
+        }
+    }
+    #[test]
+    fn search_operators_do_not_consume_adjacent_tokens_or_bindings() {
+        let sql = "SELECT to_tsvector(name)@@to_tsquery(:query), payload@?'$.tags', payload@@'$ > 0', @bind, $1 FROM users WHERE id=:id";
+        let values: Vec<_> =
+            sql_placeholder_spans_for_dialect(sql, SqlPlaceholderDialect::Postgres)
+                .iter()
+                .map(|span| &sql[span.start..span.end])
+                .collect();
+        assert_eq!(values, [":query", "@bind", "$1", ":id"]);
+        let sql = "SELECT @@version, @bind, ? FROM users WHERE id=:id";
+        let values: Vec<_> = sql_placeholder_spans_for_dialect(sql, SqlPlaceholderDialect::Mysql)
+            .iter()
+            .map(|span| &sql[span.start..span.end])
+            .collect();
+        assert_eq!(values, ["@bind", "?", ":id"]);
     }
 }

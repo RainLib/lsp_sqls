@@ -147,11 +147,20 @@ fn insert_value_hints_fail_closed_for_select_wildcards_and_arity_mismatch() {
 }
 
 #[test]
-fn insert_value_hints_match_sql_server_catalog_and_implicit_dbo() {
+fn insert_value_hints_require_explicit_omitted_schema_resolution() {
     let mut schema = completion_schema_with_columns();
     schema.catalog = Some("AppDb".to_string());
     schema.database = "dbo".to_string();
     let sql = "INSERT INTO [AppDb]..[orders] WITH (TABLOCK) VALUES (1, 2, 3);";
+
+    assert!(inlay_labels(sql, &schema).is_empty());
+    schema.namespace = Some(
+        serde_json::from_value(serde_json::json!({"default_schema":"dbo","tables_complete":true}))
+            .unwrap(),
+    );
+    let manager = crate::schema::SchemaManager::new();
+    manager.register(schema);
+    let schema = manager.resolve_omitted_schema("AppDb..orders").unwrap();
 
     assert_eq!(
         inlay_labels(sql, &schema),

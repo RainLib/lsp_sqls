@@ -1,7 +1,7 @@
 //! Shared SQL semantic fixtures.
 
 use super::builtin_completion::{
-    add_builtin_function_completions, add_clickhouse_table_function_completions,
+    add_builtin_function_completions, add_builtin_table_function_completions,
     add_oracle_table_function_completions, add_window_function_completions,
     oracle_table_routine_context,
 };
@@ -132,6 +132,8 @@ use tower_lsp::lsp_types::Url;
 fn test_schema(database: &str, tables: &[&str]) -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: database.to_string(),
         server_version: None,
@@ -167,6 +169,8 @@ fn diagnostic_codes(diagnostics: &[tower_lsp::lsp_types::Diagnostic]) -> Vec<Str
 fn semantic_test_schema() -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "app".to_string(),
         server_version: None,
@@ -199,6 +203,8 @@ fn semantic_test_schema() -> Schema {
 fn completion_schema_with_columns() -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "app".to_string(),
         server_version: None,
@@ -279,6 +285,7 @@ mod locations;
 mod dialect_resolution;
 
 mod diagnostics;
+mod inspections;
 
 mod schema_resolution;
 
@@ -297,3 +304,23 @@ mod join_actions;
 mod code_actions;
 
 mod project_index;
+
+mod call_completion;
+mod complex_semantics;
+mod configuration_state;
+mod execute_calls;
+mod execute_values;
+mod named_arguments;
+mod routine_context;
+mod routine_identity;
+mod routine_modes;
+mod routine_overloads;
+mod tsql_modules;
+mod udf_outputs;
+
+mod inspection_scopes;
+
+mod shared_syntax;
+
+mod ambiguity_scopes;
+mod analysis_consistency;

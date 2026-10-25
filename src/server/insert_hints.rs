@@ -4,16 +4,25 @@ use super::document_structure::position_for_offset;
 use super::limits::{
     INLAY_HINT_MAX_ITEMS, INLAY_HINT_REQUEST_MAX_BYTES, INLAY_HINT_STATEMENT_SCAN_BYTES,
 };
-use super::schema_resolution::schema_table_matches;
 use super::sql_scan::{
     ceil_char_boundary, find_sql_keyword, find_sql_keyword_at_depth, floor_char_boundary,
     matching_sql_paren, read_insert_qualified_identifier, skip_insert_target_alias,
     skip_sql_whitespace, sql_keyword_at,
 };
 use crate::parser::SqlParser;
-use crate::schema::Schema;
+use crate::schema::{Schema, SchemaManager};
 use tower_lsp::lsp_types::*;
+#[cfg(test)]
 pub(super) fn insert_value_hints(text: &str, range: Range, schema: &Schema) -> Vec<InlayHint> {
+    insert_value_hints_with_metadata(text, range, Some(schema), None)
+}
+pub(super) fn insert_value_hints_with_metadata(
+    text: &str,
+    range: Range,
+    schema: Option<&Schema>,
+    manager: Option<&SchemaManager>,
+) -> Vec<InlayHint> {
+    let mut lookup = crate::relation_bindings::RelationLookup::new(schema, manager);
     let absolute_range_start = position_to_byte_offset(text, range.start);
     let absolute_range_end = position_to_byte_offset(text, range.end)
         .max(absolute_range_start)
@@ -112,10 +121,8 @@ pub(super) fn insert_value_hints(text: &str, range: Range, schema: &Schema) -> V
         }
 
         let resolved_columns = columns.unwrap_or_else(|| {
-            schema
-                .tables
-                .iter()
-                .find(|table| schema_table_matches(schema, &table_reference, table))
+            lookup
+                .table(&table_reference)
                 .map(|table| {
                     table
                         .columns

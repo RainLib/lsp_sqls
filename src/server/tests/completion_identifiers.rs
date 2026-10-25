@@ -6,7 +6,7 @@ fn completion_includes_visible_relation_alias_as_a_first_class_item() {
     let position = Position::new(0, "SELECT us".len() as u32);
     let mut items = Vec::new();
 
-    add_referenced_alias_completions(sql, position, &mut items);
+    add_referenced_alias_completions(sql, position, &mut items, None);
 
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].label, "us");
@@ -21,7 +21,7 @@ fn relation_alias_completion_preserves_quoted_alias_sql() {
     let position = Position::new(0, "SELECT ua".len() as u32);
     let mut items = Vec::new();
 
-    add_referenced_alias_completions(sql, position, &mut items);
+    add_referenced_alias_completions(sql, position, &mut items, None);
 
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].label, "User Alias");
@@ -34,7 +34,12 @@ fn relation_alias_completion_keeps_quoted_collisions_and_fuzzy_matches() {
     let collision_position = Position::new(0, "SELECT u".len() as u32);
     let mut collision_items = Vec::new();
 
-    add_referenced_alias_completions(collision_sql, collision_position, &mut collision_items);
+    add_referenced_alias_completions(
+        collision_sql,
+        collision_position,
+        &mut collision_items,
+        None,
+    );
 
     assert_eq!(collision_items.len(), 2);
     assert!(collision_items
@@ -47,7 +52,7 @@ fn relation_alias_completion_keeps_quoted_collisions_and_fuzzy_matches() {
     let fuzzy_sql = "SELECT cmo FROM app.customer_orders customerOrder";
     let fuzzy_position = Position::new(0, "SELECT cmo".len() as u32);
     let mut fuzzy_items = Vec::new();
-    add_referenced_alias_completions(fuzzy_sql, fuzzy_position, &mut fuzzy_items);
+    add_referenced_alias_completions(fuzzy_sql, fuzzy_position, &mut fuzzy_items, None);
 
     let alias = fuzzy_items
         .iter()
@@ -64,7 +69,7 @@ fn relation_alias_completion_stays_out_of_relation_targets_and_sql_noise() {
         ("SELECT '-- us' FROM app.users us", Position::new(0, 12)),
     ] {
         let mut items = Vec::new();
-        add_referenced_alias_completions(sql, position, &mut items);
+        add_referenced_alias_completions(sql, position, &mut items, None);
         assert!(
             items.is_empty(),
             "unexpected alias completion for {sql}: {items:?}"

@@ -54,7 +54,6 @@ pub const POSTGRES_COMPATIBILITY_ALIASES: &[&str] = &[
     "oracle",
     "questdb",
     "redshift",
-    "sqlserver",
     "timescaledb",
     "vastbase",
     "vertica",
@@ -97,13 +96,18 @@ impl DialectRegistry {
             registry.register_alias(alias, postgres.clone());
         }
 
+        let sqlserver = Arc::new(PostgresDialect::sqlserver());
+        registry.register(sqlserver.clone());
+        registry.register_alias("mssql", sqlserver.clone());
+        registry.register_alias("tsql", sqlserver);
+
         let sqlite = Arc::new(SqliteDialect::new());
         registry.register(sqlite.clone());
         registry.register_alias("sqlite3", sqlite.clone());
         // DuckDB shares the SQLite-compatible completion baseline for now.
         // Keep its public language ID distinct so external driver packages can
         // describe their real engine without being reduced to generic SQL.
-        registry.register_alias("duckdb", sqlite.clone());
+        registry.register(Arc::new(SqliteDialect::ansi()));
         for alias in SQLITE_COMPATIBILITY_ALIASES {
             registry.register_alias(alias, sqlite.clone());
         }
@@ -159,6 +163,21 @@ impl DialectRegistry {
             .cloned()
     }
 
+    /// Snapshot requests use an explicit, normalized registry identity.
+    /// Preserve the resolved adapter and its registered identity rather than
+    /// guessing a parser from the name of a related engine.
+    pub fn get_explicit_profile(&self, name: &str) -> Option<Arc<dyn Dialect>> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+        {
+            return None;
+        }
+        self.get_by_name(name)
+    }
+
     pub fn list_names(&self) -> Vec<String> {
         self.dialects.iter().map(|d| d.name().to_string()).collect()
     }
@@ -173,15 +192,32 @@ impl Default for DialectRegistry {
 #[cfg(test)]
 mod tests {
     use super::DialectRegistry;
+    #[test]
+    fn explicit_profiles_preserve_registered_adapters_and_reject_unnormalized_ids() {
+        let registry = DialectRegistry::new();
+        for name in ["duckdb", "mariadb", "postgresql", "mssql", "argo", "turso"] {
+            assert!(std::sync::Arc::ptr_eq(
+                &registry.get_explicit_profile(name).unwrap(),
+                &registry.get_by_name(name).unwrap()
+            ));
+        }
+        assert!(!std::sync::Arc::ptr_eq(
+            &registry.get_explicit_profile("duckdb").unwrap(),
+            &registry.get_explicit_profile("sqlite").unwrap()
+        ));
+        for name in ["", "POSTGRES", "postgres ", "not-registered", "../sqlite"] {
+            assert!(registry.get_explicit_profile(name).is_none());
+        }
+    }
 
     #[test]
-    fn resolves_duckdb_to_the_sqlite_compatible_baseline() {
+    fn duckdb_keeps_its_own_identity_on_the_ansi_completion_baseline() {
         let registry = DialectRegistry::new();
         let dialect = registry
             .get_by_name("duckdb")
-            .expect("DuckDB alias should be registered");
+            .expect("DuckDB profile should be registered");
 
-        assert_eq!(dialect.name(), "sqlite");
+        assert_eq!(dialect.name(), "duckdb");
     }
 
     #[test]

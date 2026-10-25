@@ -8,25 +8,86 @@ use crate::{
 };
 use std::collections::HashMap;
 
+mod argument_types;
+mod column_constraints;
+mod expression_types;
+mod hive_types;
+mod lateral_views;
+pub(super) use argument_types::{
+    infer_comparison_left_type, infer_comparison_value_type, infer_continuation_type,
+    infer_routine_argument_types,
+};
+#[cfg(test)]
+mod output_tests;
+#[cfg(test)]
+mod pattern_escape_tests;
+#[cfg(test)]
+mod pattern_tests;
+#[cfg(test)]
+mod predicate_tests;
+mod projection;
+mod provenance;
+mod qualify;
+#[cfg(test)]
+mod quantified_tests;
+mod query_output;
+pub(super) use qualify::add_qualify_completions;
+mod recursive_ctes;
+mod scalar_queries;
+mod with_queries;
+#[cfg(test)]
+pub(super) use query_output::infer_query_output_columns;
 mod syntax;
+mod table_functions;
+mod table_variables;
+mod variables;
 pub(super) use syntax::*;
 use tower_lsp::lsp_types::Position;
 
 pub(super) const LOCAL_RELATION_SCAN_MAX_BYTES: usize = 512 * 1024;
 
+#[cfg(test)]
 pub(super) fn augment_schema_with_local_relations(
+    schema: Schema,
+    text: &str,
+    position: Position,
+    uri: &str,
+    dialect: Option<&str>,
+) -> Schema {
+    augment_schema_with_local_relations_and_routines(schema, text, position, uri, dialect, None)
+}
+
+pub(super) fn augment_schema_with_local_relations_and_routines(
     mut schema: Schema,
     text: &str,
     position: Position,
     uri: &str,
+    dialect: Option<&str>,
+    routines: Option<&crate::schema::SchemaManager>,
 ) -> Schema {
+    let dialect =
+        dialect.map(
+            |name| match crate::placeholder::SqlPlaceholderDialect::for_name(Some(name)) {
+                crate::placeholder::SqlPlaceholderDialect::Postgres => "postgres",
+                crate::placeholder::SqlPlaceholderDialect::Mysql => "mysql",
+                crate::placeholder::SqlPlaceholderDialect::SqlServer => "sqlserver",
+                _ => name,
+            },
+        );
     let cursor = position_to_byte_offset(text, position).min(text.len());
     if text.len() > LOCAL_RELATION_SCAN_MAX_BYTES {
         return schema;
     }
     let searchable = SqlParser::mask_sql_noise(text).to_ascii_uppercase();
-    let mut local_relations =
-        temporary_tables_before_cursor(&text[..cursor], &searchable[..cursor], &schema, uri);
+    let mut local_relations = temporary_tables_before_cursor(
+        &text[..cursor],
+        &searchable[..cursor],
+        &schema,
+        uri,
+        dialect,
+        routines,
+    );
+    local_relations.extend(table_variables::tables(text, cursor, uri, dialect));
     let start = SqlParser::previous_statement_start(&searchable, cursor);
     let end = SqlParser::next_statement_end(&searchable, cursor);
     // Preserve byte offsets and newlines for navigation into the original URI.
@@ -39,6 +100,14 @@ pub(super) fn augment_schema_with_local_relations(
     let statement = String::from_utf8(statement).expect("masked SQL remains UTF-8");
     let searchable_upper = SqlParser::mask_sql_noise(&statement).to_ascii_uppercase();
     let visible = statement.as_str();
+    let variables = variables::Snapshot::new(text, cursor, dialect, None);
+    let environment = query_output::Environment {
+        variables: variables
+            .as_ref()
+            .and_then(|snapshot| snapshot.origin(visible)),
+        routines,
+        origin: None,
+    };
     let mut base_schema = schema.clone();
     for table in &local_relations {
         install_local_table(&mut base_schema, table.clone());
@@ -49,6 +118,8 @@ pub(super) fn augment_schema_with_local_relations(
         &base_schema,
         uri,
         cursor,
+        dialect,
+        environment,
     ));
     for table in &local_relations {
         install_local_table(&mut base_schema, table.clone());
@@ -59,13 +130,12 @@ pub(super) fn augment_schema_with_local_relations(
         &base_schema,
         uri,
         cursor,
+        dialect,
+        environment,
     ));
     let mut relation_schema = schema.clone();
     for table in &local_relations {
-        relation_schema
-            .tables
-            .retain(|candidate| !candidate.name.eq_ignore_ascii_case(&table.name));
-        relation_schema.tables.push(table.clone());
+        install_local_table(&mut relation_schema, table.clone());
     }
     local_relations.extend(correlated_tables_before_cursor(
         visible,
@@ -74,15 +144,22 @@ pub(super) fn augment_schema_with_local_relations(
         uri,
         cursor,
     ));
+    local_relations.extend(table_functions::declared_function_tables(
+        visible,
+        &searchable_upper,
+        uri,
+        cursor,
+        dialect,
+    ));
 
     // Apply in discovery order so the most local shape wins. A correlation
     // column list shadows remote/CTE names positionally, and a CTE shadows a
     // temporary relation with the same name.
     for table in local_relations {
-        schema
-            .tables
-            .retain(|candidate| !candidate.name.eq_ignore_ascii_case(&table.name));
-        schema.tables.insert(0, table);
+        install_local_table(&mut schema, table);
+    }
+    for table in lateral_views::tables(visible, &schema, uri, cursor, dialect, environment) {
+        install_local_table(&mut schema, table);
     }
     schema
 }
@@ -92,6 +169,8 @@ pub(super) fn temporary_tables_before_cursor(
     upper: &str,
     schema: &Schema,
     uri: &str,
+    dialect: Option<&str>,
+    routines: Option<&crate::schema::SchemaManager>,
 ) -> Vec<Table> {
     let mut tables = HashMap::<String, (usize, Table)>::new();
     for keyword in ["CREATE TEMP TABLE", "CREATE TEMPORARY TABLE"] {
@@ -136,11 +215,13 @@ pub(super) fn temporary_tables_before_cursor(
                     .find(';')
                     .map_or(source.len(), |relative| query_start + relative);
                 (
-                    infer_query_output_columns(
+                    query_output::infer_query_output_columns_with_routines(
                         &source[query_start..statement_end],
                         schema,
                         uri,
                         source_line,
+                        dialect,
+                        routines,
                     ),
                     statement_end,
                 )
@@ -183,41 +264,61 @@ pub(super) fn temporary_tables_before_cursor(
 }
 
 pub(super) fn parse_temporary_column(definition: &str, uri: &str, line: u32) -> Option<Column> {
-    let (name, _, name_end) = read_local_identifier_after(definition, 0)?;
-    if matches!(
-        name.to_ascii_uppercase().as_str(),
-        "PRIMARY" | "UNIQUE" | "CONSTRAINT" | "CHECK" | "FOREIGN" | "EXCLUDE"
-    ) {
+    parse_temporary_column_with_mask(
+        definition,
+        &SqlParser::mask_sql_noise(definition),
+        uri,
+        line,
+    )
+}
+
+fn parse_temporary_column_with_mask(
+    definition: &str,
+    masked: &str,
+    uri: &str,
+    line: u32,
+) -> Option<Column> {
+    let (name, name_start, name_end) = read_local_identifier_after(definition, 0)?;
+    if !matches!(definition.as_bytes()[name_start], b'"' | b'`' | b'[')
+        && matches!(
+            name.to_ascii_uppercase().as_str(),
+            "PRIMARY" | "UNIQUE" | "CONSTRAINT" | "CHECK" | "FOREIGN" | "EXCLUDE"
+        )
+    {
         return None;
     }
-    let (data_type, _, _) = read_local_identifier_after(definition, name_end)
+    let (data_type, _, type_end) = read_local_identifier_after(definition, name_end)
         .unwrap_or_else(|| ("unknown".to_string(), name_end, name_end));
+    let flags = column_constraints::flags(definition, masked, type_end);
     Some(Column {
         name,
         data_type,
-        nullable: !definition.to_ascii_uppercase().contains("NOT NULL"),
-        primary_key: definition.to_ascii_uppercase().contains("PRIMARY KEY"),
-        unique: definition.to_ascii_uppercase().contains("UNIQUE"),
+        nullable: !flags.not_null,
+        primary_key: flags.primary_key,
+        unique: flags.unique,
         indexed: false,
         default_value: None,
         auto_increment: false,
         generated: false,
         hidden: false,
-        comment: Some("Column from a temporary table in the current console".to_string()),
+        comment: None,
         source_location: Some((uri.to_string(), line)),
     })
 }
 
-pub(super) fn cte_tables_before_cursor(
+fn cte_tables_before_cursor(
     source: &str,
     upper: &str,
     schema: &Schema,
     uri: &str,
     position: usize,
+    dialect: Option<&str>,
+    environment: query_output::Environment<'_>,
 ) -> Vec<Table> {
     let mut tables = Vec::new();
     let mut working_schema = schema.clone();
     let mut search = 0;
+    let mut parsed_origin = None;
     while let Some(relative) = upper[search..].find("WITH") {
         let with_start = search + relative;
         if with_start > position
@@ -233,11 +334,7 @@ pub(super) fn cte_tables_before_cursor(
         if recursive {
             cursor = skip_sql_trivia(source, cursor + "RECURSIVE".len());
         }
-        loop {
-            let Some((name, name_start, name_end)) = read_local_identifier_after(source, cursor)
-            else {
-                break;
-            };
+        while let Some((name, name_start, name_end)) = read_local_identifier_after(source, cursor) {
             cursor = skip_sql_trivia(source, name_end);
             let mut explicit_columns = Vec::new();
             if source[cursor..].starts_with('(') {
@@ -263,21 +360,54 @@ pub(super) fn cte_tables_before_cursor(
             }
             let closing = matching_parenthesis_in_searchable(upper, cursor).unwrap_or(source.len());
             let inside_body = cursor < position && position <= closing;
-            if position <= cursor || (inside_body && !recursive) {
+            if position <= cursor {
                 break;
             }
             let body = &source[cursor + 1..closing];
             let source_line = source[..name_start].matches('\n').count() as u32 + 1;
-            let columns = if explicit_columns.is_empty() {
-                infer_query_output_columns(body, &working_schema, uri, source_line)
-            } else {
-                explicit_columns
-                    .into_iter()
-                    .map(|column_name| {
-                        local_relation_column(column_name, "unknown", uri, source_line)
-                    })
-                    .collect()
+            let origin = parsed_origin
+                .get_or_insert_with(|| provenance::ParsedOrigin::new(source, dialect))
+                .view();
+            let environment = query_output::Environment {
+                origin,
+                ..environment
             };
+            let shape = if recursive || recursive_ctes::implicit(dialect) {
+                recursive_ctes::infer(
+                    &recursive_ctes::Definition {
+                        name: &name,
+                        quoted: matches!(source.as_bytes()[name_start], b'"' | b'`' | b'['),
+                        names: &explicit_columns,
+                        body,
+                        upper: &upper[cursor + 1..closing],
+                        line: source_line,
+                    },
+                    &working_schema,
+                    uri,
+                    dialect,
+                    environment,
+                )
+            } else {
+                None
+            };
+            if inside_body
+                && shape
+                    .as_ref()
+                    .is_none_or(|shape| position - cursor - 1 < shape.member_start)
+            {
+                break;
+            }
+            let columns = shape.map(|shape| shape.columns).unwrap_or_else(|| {
+                query_output::infer_with_environment(
+                    body,
+                    &working_schema,
+                    uri,
+                    source_line,
+                    dialect,
+                    &explicit_columns,
+                    environment,
+                )
+            });
             let table =
                 local_relation_table(name, "COMMON TABLE EXPRESSION", columns, uri, source_line);
             install_local_table(&mut working_schema, table.clone());
@@ -296,14 +426,52 @@ pub(super) fn cte_tables_before_cursor(
     tables
 }
 
-pub(super) fn derived_tables_before_cursor(
+fn derived_tables_before_cursor(
     source: &str,
     upper: &str,
     schema: &Schema,
     uri: &str,
     position: usize,
+    dialect: Option<&str>,
+    environment: query_output::Environment<'_>,
+) -> Vec<Table> {
+    let mut parsed_origin = None;
+    derived_tables_with_inference(
+        source,
+        upper,
+        schema,
+        uri,
+        position,
+        |body, schema, line, names| {
+            let origin = parsed_origin
+                .get_or_insert_with(|| provenance::ParsedOrigin::new(source, dialect))
+                .view();
+            query_output::infer_with_environment(
+                body,
+                schema,
+                uri,
+                line,
+                dialect,
+                names,
+                query_output::Environment {
+                    origin,
+                    ..environment
+                },
+            )
+        },
+    )
+}
+
+fn derived_tables_with_inference(
+    source: &str,
+    upper: &str,
+    schema: &Schema,
+    uri: &str,
+    position: usize,
+    mut infer: impl FnMut(&str, &Schema, u32, &[String]) -> Vec<Column>,
 ) -> Vec<Table> {
     let mut tables = Vec::new();
+    let mut working_schema = None;
     for source_start in local_relation_source_starts(upper) {
         if !scope_contains(upper, source_start, position) {
             continue;
@@ -333,7 +501,11 @@ pub(super) fn derived_tables_before_cursor(
         else {
             continue;
         };
-        if Keywords::is_keyword(&alias) {
+        if !matches!(
+            source.as_bytes().get(alias_offset),
+            Some(b'"' | b'`' | b'[')
+        ) && Keywords::is_keyword(&alias)
+        {
             continue;
         }
         let body = &source[opening + 1..closing];
@@ -341,21 +513,37 @@ pub(super) fn derived_tables_before_cursor(
             continue;
         }
         let source_line = source[..alias_offset].matches('\n').count() as u32 + 1;
-        let columns = merge_local_column_aliases(
-            infer_query_output_columns(body, schema, uri, source_line),
-            correlation_column_names_after(source, upper, alias_end).unwrap_or_default(),
-            uri,
+        let mut columns = infer(
+            body,
+            working_schema.as_ref().unwrap_or(schema),
             source_line,
+            &correlation_column_names_after(source, upper, alias_end).unwrap_or_default(),
         );
-        tables.push(local_relation_table(
-            alias,
-            "DERIVED TABLE",
-            columns,
-            uri,
-            source_line,
-        ));
+        if derived_is_null_extended(&upper[..opening]) {
+            for column in &mut columns {
+                column.nullable = true;
+            }
+        }
+        let table = local_relation_table(alias, "DERIVED TABLE", columns, uri, source_line);
+        install_local_table(
+            working_schema.get_or_insert_with(|| schema.clone()),
+            table.clone(),
+        );
+        tables.push(table);
     }
     tables
+}
+
+fn derived_is_null_extended(prefix: &str) -> bool {
+    let words: Vec<_> = prefix
+        .trim_end()
+        .rsplit(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|word| !word.is_empty())
+        .take(4)
+        .collect();
+    matches!(words.first().copied(), Some("APPLY")) && words.get(1) == Some(&"OUTER")
+        || matches!(words.first().copied(), Some("JOIN" | "LATERAL"))
+            && words.iter().any(|word| matches!(*word, "LEFT" | "FULL"))
 }
 
 pub(super) fn correlated_tables_before_cursor(
@@ -403,7 +591,9 @@ pub(super) fn correlated_tables_before_cursor(
         else {
             continue;
         };
-        if Keywords::is_keyword(&alias) {
+        if !matches!(source.as_bytes().get(alias_start), Some(b'"' | b'`' | b'['))
+            && Keywords::is_keyword(&alias)
+        {
             continue;
         }
         cursor = skip_local_whitespace(source, alias_end);
@@ -420,7 +610,11 @@ pub(super) fn correlated_tables_before_cursor(
             continue;
         }
 
-        let table_name = SqlParser::identifier_last_part(&reference);
+        let table_name = if is_table_function {
+            SqlParser::identifier_last_part(&reference)
+        } else {
+            alias.clone()
+        };
         let base_columns = schema
             .tables
             .iter()
@@ -432,6 +626,15 @@ pub(super) fn correlated_tables_before_cursor(
             .count() as u32
             + 1;
         let columns = merge_local_column_aliases(base_columns, column_aliases, uri, source_line);
+        if is_table_function && alias != table_name {
+            tables.push(local_relation_table(
+                alias,
+                "TABLE FUNCTION",
+                columns.clone(),
+                uri,
+                source_line,
+            ));
+        }
         tables.push(local_relation_table(
             table_name,
             if is_table_function {
@@ -461,7 +664,6 @@ pub(super) fn merge_local_column_aliases(
     }
     for (column, alias) in columns.iter_mut().zip(aliases) {
         column.name = alias;
-        column.comment = Some("Column renamed by a correlation list".to_string());
         column.source_location = Some((uri.to_string(), line));
     }
     columns
@@ -520,113 +722,6 @@ pub(super) fn is_sqlserver_table_hint_list(names: &[String]) -> bool {
     })
 }
 
-pub(super) fn infer_query_output_columns(
-    query: &str,
-    schema: &Schema,
-    uri: &str,
-    source_line: u32,
-) -> Vec<Column> {
-    let Some(select) = find_top_level_keyword(query, 0, "SELECT") else {
-        return Vec::new();
-    };
-    let projection_start = select + "SELECT".len();
-    let projection_end = ["FROM", "UNION", "INTERSECT", "EXCEPT", "ORDER", "LIMIT"]
-        .iter()
-        .filter_map(|keyword| find_top_level_keyword(query, projection_start, keyword))
-        .min()
-        .unwrap_or(query.len());
-    let mut columns = Vec::new();
-    for (start, end) in split_top_level_ranges(query, projection_start, projection_end) {
-        let expression = query[start..end].trim();
-        if expression.is_empty() {
-            continue;
-        }
-        if expression == "*" || expression.ends_with(".*") {
-            let mut parser = SqlParser::new();
-            if let Some(tree) = parser.parse(query).tree {
-                let position = SqlParser::lsp_position_to_byte_position(
-                    query,
-                    crate::position::lsp_position_at_end(&query[..projection_start]),
-                );
-                let references = parser.extract_row_sources_at_position(&tree, query, position);
-                let qualifier = expression.strip_suffix(".*").map(str::trim);
-                let target = qualifier.map(|name| {
-                    SqlParser::relation_aliases_at_position(query, position)
-                        .into_iter()
-                        .find(|alias| alias.name.eq_ignore_ascii_case(name))
-                        .map(|alias| alias.relation)
-                        .unwrap_or_else(|| name.to_string())
-                });
-                // Preserve FROM order, and never expand other JOIN sources for a.*.
-                for reference in &references {
-                    if target
-                        .as_ref()
-                        .is_some_and(|target| !target.eq_ignore_ascii_case(reference))
-                    {
-                        continue;
-                    }
-                    if let Some(table) = schema
-                        .tables
-                        .iter()
-                        .find(|table| schema_table_matches(schema, reference, table))
-                    {
-                        columns.extend(
-                            table
-                                .columns
-                                .iter()
-                                .filter(|column| !column.hidden)
-                                .cloned(),
-                        );
-                    }
-                }
-            }
-            continue;
-        }
-        let name = select_expression_output_name(expression);
-        let Some(name) = name else {
-            continue;
-        };
-        if columns
-            .iter()
-            .any(|column: &Column| column.name.eq_ignore_ascii_case(&name))
-        {
-            continue;
-        }
-        let data_type = schema
-            .tables
-            .iter()
-            .flat_map(|table| table.columns.iter())
-            .find(|column| column.name.eq_ignore_ascii_case(&name))
-            .map(|column| column.data_type.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        columns.push(local_relation_column(name, &data_type, uri, source_line));
-    }
-    columns
-}
-
-pub(super) fn select_expression_output_name(expression: &str) -> Option<String> {
-    let upper = SqlParser::mask_sql_noise(expression).to_ascii_uppercase();
-    if let Some(as_offset) = upper.rfind(" AS ") {
-        return read_local_identifier_after(expression, as_offset + " AS ".len())
-            .map(|(name, _, _)| name);
-    }
-    let trimmed = expression.trim();
-    if trimmed
-        .chars()
-        .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$' | '.'))
-    {
-        return trimmed.rsplit('.').next().map(str::to_string);
-    }
-    let trailing = trimmed
-        .split_whitespace()
-        .next_back()
-        .filter(|value| !Keywords::is_keyword(value))?;
-    trailing
-        .chars()
-        .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
-        .then(|| trailing.to_string())
-}
-
 pub(super) fn local_relation_table(
     name: String,
     object_type: &str,
@@ -657,35 +752,18 @@ pub(super) fn local_relation_column(name: String, data_type: &str, uri: &str, li
         auto_increment: false,
         generated: false,
         hidden: false,
-        comment: Some("Output column inferred from the current console".to_string()),
+        comment: None,
         source_location: Some((uri.to_string(), line)),
     }
 }
 
 fn install_local_table(schema: &mut Schema, table: Table) {
-    schema
-        .tables
-        .retain(|candidate| !candidate.name.eq_ignore_ascii_case(&table.name));
-    schema.tables.push(table);
+    crate::relation_bindings::install(schema, table);
 }
 
 // A relation in a closed sibling subquery is invisible to this cursor.
 fn scope_contains(searchable: &str, offset: usize, cursor: usize) -> bool {
-    let mut stack = Vec::new();
-    for (index, byte) in searchable.bytes().enumerate().take(offset) {
-        match byte {
-            b'(' => stack.push(index),
-            b')' => {
-                stack.pop();
-            }
-            _ => {}
-        }
-    }
-    stack.last().is_none_or(|open| {
-        cursor > *open
-            && cursor
-                <= matching_parenthesis_in_searchable(searchable, *open).unwrap_or(searchable.len())
-    })
+    SqlParser::query_source_visible(searchable, offset, cursor)
 }
 
 #[cfg(test)]
@@ -700,6 +778,8 @@ mod tests {
         augment_schema_with_local_relations(
             Schema {
                 id: SchemaId::new(),
+                server: None,
+                namespace: None,
                 catalog: None,
                 database: "public".into(),
                 server_version: None,
@@ -725,6 +805,7 @@ mod tests {
             &sql,
             position,
             "oxide://query/scope.sql",
+            Some("postgres"),
         )
     }
     fn names(schema: &Schema, name: &str) -> Vec<String> {
@@ -827,32 +908,5 @@ mod tests {
         let schema =
             at_marker("WITH a AS (SELECT 1 AS seed UNION ALL SELECT 2 AS other) SELECT a.| FROM a");
         assert_eq!(names(&schema, "a"), ["seed"]);
-    }
-}
-
-fn skip_sql_trivia(source: &str, mut offset: usize) -> usize {
-    loop {
-        offset = skip_local_whitespace(source, offset);
-        if source[offset..].starts_with("--") {
-            offset = source[offset..]
-                .find('\n')
-                .map_or(source.len(), |end| offset + end);
-        } else if source[offset..].starts_with("/*") {
-            let mut depth = 1;
-            offset += 2;
-            while offset < source.len() && depth > 0 {
-                if source[offset..].starts_with("/*") {
-                    depth += 1;
-                    offset += 2;
-                } else if source[offset..].starts_with("*/") {
-                    depth -= 1;
-                    offset += 2;
-                } else {
-                    offset += source[offset..].chars().next().unwrap().len_utf8();
-                }
-            }
-        } else {
-            return offset;
-        }
     }
 }

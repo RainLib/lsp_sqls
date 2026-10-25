@@ -8,6 +8,7 @@ pub(super) fn add_referenced_alias_completions(
     text: &str,
     position: Position,
     items: &mut Vec<CompletionItem>,
+    scoped_aliases: Option<&[crate::parser::RelationAlias]>,
 ) {
     if relation_alias_context_at_position(text, position) {
         return;
@@ -41,7 +42,16 @@ pub(super) fn add_referenced_alias_completions(
     // Alias discovery is a bounded, text-only scope scan.  It deliberately
     // avoids constructing a second tree-sitter parse after the dialect has
     // already produced its semantic completion candidates.
-    let aliases = SqlParser::relation_aliases_at_position(text, position);
+    let fallback;
+    let aliases = if let Some(aliases) = scoped_aliases {
+        aliases
+    } else {
+        fallback = SqlParser::relation_aliases_at_position(
+            text,
+            SqlParser::lsp_position_to_byte_position(text, position),
+        );
+        &fallback
+    };
     for alias in aliases {
         let Some(match_rank) = identifier_match_rank(&alias.name, &prefix) else {
             continue;
@@ -58,8 +68,8 @@ pub(super) fn add_referenced_alias_completions(
             label: alias.name.clone(),
             kind: Some(CompletionItemKind::VARIABLE),
             detail: Some(format!("Table alias · {}", alias.relation)),
-            filter_text: Some(alias.name.clone()),
-            insert_text: Some(alias.sql),
+            filter_text: Some(crate::identifier_search::filter_text(&alias.name, None)),
+            insert_text: Some(alias.sql.clone()),
             sort_text: Some(format!("-2:alias:{match_rank}:{normalized}")),
             ..Default::default()
         });
@@ -136,6 +146,12 @@ pub(super) fn quote_completion_identifier(identifier: &str, dialect_name: &str) 
     {
         return identifier.to_string();
     }
+    quote_raw_completion_identifier(identifier, dialect_name)
+}
+
+/// Metadata is decoded. A name containing literal quote delimiters must itself
+/// be quoted and escaped rather than mistaken for already written SQL.
+pub(super) fn quote_raw_completion_identifier(identifier: &str, dialect_name: &str) -> String {
     let simple_lower = identifier
         .chars()
         .next()
@@ -247,31 +263,8 @@ pub(super) fn qualified_identifier_range_at_position(
 }
 
 pub(super) fn identifier_path_start_before_cursor(text_before: &str) -> Option<usize> {
-    let mut token_start = 0;
-    let mut quote_end: Option<char> = None;
-    let mut chars = text_before.char_indices().peekable();
-
-    while let Some((index, ch)) = chars.next() {
-        if let Some(end_quote) = quote_end {
-            if ch == end_quote {
-                if chars.peek().is_some_and(|(_, next)| *next == end_quote) {
-                    chars.next();
-                    continue;
-                }
-                quote_end = None;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' | '\'' | '`' => quote_end = Some(ch),
-            '[' => quote_end = Some(']'),
-            _ if is_identifier_path_boundary(ch) => token_start = index + ch.len_utf8(),
-            _ => {}
-        }
-    }
-
-    (token_start < text_before.len()).then_some(token_start)
+    let token = SqlParser::identifier_path_token_before_cursor(text_before)?;
+    Some(text_before.len() - token.len())
 }
 
 pub(super) fn is_identifier_path_boundary(ch: char) -> bool {

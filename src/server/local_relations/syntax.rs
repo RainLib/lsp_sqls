@@ -1,5 +1,3 @@
-use crate::parser::SqlParser;
-
 pub(in crate::server) fn read_local_identifier_after(
     source: &str,
     start: usize,
@@ -8,14 +6,21 @@ pub(in crate::server) fn read_local_identifier_after(
     let first = source[start..].chars().next()?;
     if matches!(first, '"' | '`' | '[') {
         let closing = if first == '[' { ']' } else { first };
-        let content_start = start + first.len_utf8();
-        let relative_end = source[content_start..].find(closing)?;
-        let content_end = content_start + relative_end;
-        return Some((
-            source[content_start..content_end].to_string(),
-            start,
-            content_end + closing.len_utf8(),
-        ));
+        let mut cursor = start + first.len_utf8();
+        let mut name = String::new();
+        while let Some(character) = source[cursor..].chars().next() {
+            cursor += character.len_utf8();
+            if character == closing {
+                if source[cursor..].starts_with(closing) {
+                    name.push(closing);
+                    cursor += closing.len_utf8();
+                    continue;
+                }
+                return Some((name, start, cursor));
+            }
+            name.push(character);
+        }
+        return None;
     }
     if !(first == '_' || first.is_alphabetic()) {
         return None;
@@ -34,6 +39,18 @@ pub(in crate::server) fn read_local_identifier_path_after(
     source: &str,
     start: usize,
 ) -> Option<(String, usize, usize)> {
+    let (parts, start, end) = read_local_identifier_parts_after(source, start)?;
+    Some((
+        crate::parser::SqlParser::identifier_path_from_parts(&parts),
+        start,
+        end,
+    ))
+}
+
+pub(in crate::server) fn read_local_identifier_parts_after(
+    source: &str,
+    start: usize,
+) -> Option<(Vec<String>, usize, usize)> {
     let (first, path_start, mut path_end) = read_local_identifier_after(source, start)?;
     let mut parts = vec![first];
     loop {
@@ -47,7 +64,7 @@ pub(in crate::server) fn read_local_identifier_path_after(
         parts.push(part);
         path_end = part_end;
     }
-    Some((parts.join("."), path_start, path_end))
+    Some((parts, path_start, path_end))
 }
 
 pub(in crate::server) fn local_relation_source_starts(source_upper: &str) -> Vec<usize> {
@@ -154,6 +171,10 @@ pub(in crate::server) fn local_keyword_boundary(
     start: usize,
     keyword: &str,
 ) -> bool {
+    if keyword == "FROM" && crate::parser::SqlParser::is_distinct_from_keyword(source_upper, start)
+    {
+        return false;
+    }
     let end = start + keyword.len();
     let before = source_upper[..start].chars().next_back();
     let after = source_upper[end.min(source_upper.len())..].chars().next();
@@ -184,15 +205,6 @@ pub(in crate::server) fn matching_parenthesis_in_searchable(
     None
 }
 
-pub(in crate::server) fn split_top_level_ranges(
-    source: &str,
-    start: usize,
-    end: usize,
-) -> Vec<(usize, usize)> {
-    let searchable = SqlParser::mask_sql_noise(source);
-    split_top_level_ranges_in_searchable(&searchable, start, end)
-}
-
 pub(in crate::server) fn split_top_level_ranges_in_searchable(
     searchable: &str,
     start: usize,
@@ -217,12 +229,11 @@ pub(in crate::server) fn split_top_level_ranges_in_searchable(
     ranges
 }
 
-pub(in crate::server) fn find_top_level_keyword(
-    source: &str,
+pub(in crate::server) fn find_top_level_keyword_in_searchable(
+    upper: &str,
     start: usize,
     keyword: &str,
 ) -> Option<usize> {
-    let upper = SqlParser::mask_sql_noise(source).to_ascii_uppercase();
     let mut nesting = 0u32;
     for (relative, character) in upper[start..].char_indices() {
         let offset = start + relative;
@@ -231,7 +242,7 @@ pub(in crate::server) fn find_top_level_keyword(
             ')' | ']' | '}' if nesting > 0 => nesting -= 1,
             _ if nesting == 0
                 && upper[offset..].starts_with(keyword)
-                && local_keyword_boundary(&upper, offset, keyword) =>
+                && local_keyword_boundary(upper, offset, keyword) =>
             {
                 return Some(offset);
             }
@@ -239,4 +250,31 @@ pub(in crate::server) fn find_top_level_keyword(
         }
     }
     None
+}
+
+pub(in crate::server) fn skip_sql_trivia(source: &str, mut offset: usize) -> usize {
+    loop {
+        offset = skip_local_whitespace(source, offset);
+        if source[offset..].starts_with("--") {
+            offset = source[offset..]
+                .find('\n')
+                .map_or(source.len(), |end| offset + end);
+        } else if source[offset..].starts_with("/*") {
+            let mut depth = 1;
+            offset += 2;
+            while offset < source.len() && depth > 0 {
+                if source[offset..].starts_with("/*") {
+                    depth += 1;
+                    offset += 2;
+                } else if source[offset..].starts_with("*/") {
+                    depth -= 1;
+                    offset += 2;
+                } else {
+                    offset += source[offset..].chars().next().unwrap().len_utf8();
+                }
+            }
+        } else {
+            return offset;
+        }
+    }
 }

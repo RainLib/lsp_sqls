@@ -456,6 +456,17 @@ pub(crate) fn builtin_signature_catalog_for(
                 .map(|(name, parameters)| BuiltinSignature::single(name, parameters)),
         );
     }
+    // Remove legacy entries even when a replacement is version-gated out.
+    signatures.retain(|existing| {
+        !crate::search_functions::catalog_for(&normalized_dialect, None)
+            .any(|rule| rule.name.eq_ignore_ascii_case(&existing.name))
+    });
+    for signature in
+        crate::search_functions::completion_catalog(&normalized_dialect, server_version)
+    {
+        signatures.retain(|existing| !existing.name.eq_ignore_ascii_case(&signature.name));
+        signatures.push(signature);
+    }
     let existing_names = signatures
         .iter()
         .map(|signature| signature.name.to_ascii_lowercase())
@@ -527,7 +538,16 @@ pub(crate) fn builtin_table_signature_completion_catalog_for(
     if matches!(dialect.to_ascii_lowercase().as_str(), "clickhouse" | "ch") {
         clickhouse_signatures::completion_catalog(prefix, ClickHouseCatalogKind::Table, limit)
     } else {
-        Vec::new()
+        crate::search_functions::table_catalog(dialect)
+            .into_iter()
+            .filter(|signature| {
+                signature
+                    .name
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix.to_ascii_lowercase())
+            })
+            .take(limit)
+            .collect()
     }
 }
 
@@ -569,6 +589,10 @@ pub(crate) fn builtin_signatures_for(
         }
     }
 
+    let search = crate::search_functions::signatures_for(&normalized_dialect, name, server_version);
+    if !search.is_empty() {
+        return search;
+    }
     let signature = dialect_signature_entries(&normalized_dialect)
         .and_then(|entries| lookup(entries, name))
         .or_else(|| lookup(COMMON_SIGNATURES, name));

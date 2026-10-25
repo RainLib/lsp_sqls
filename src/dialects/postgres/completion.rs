@@ -9,13 +9,15 @@ pub(super) fn completion(
     sql: &str,
     position: Position,
     schema: Option<&Schema>,
-) -> Vec<CompletionItem> {
+) -> crate::dialect::CompletionSnapshot {
     let position = SqlParser::lsp_position_to_byte_position(sql, position);
     let mut parser = dialect.parser.lock().unwrap();
-    let parse_result = parser.parse(sql);
+    let syntax_tree = parser.parse_completion_tree(sql, position);
+    let mut snapshot =
+        crate::dialect::CompletionSnapshot::for_sql(&parser, syntax_tree.as_ref(), sql, position);
 
     // 分析补全上下文
-    let context = if let Some(tree) = &parse_result.tree {
+    let context = if let Some(tree) = &syntax_tree {
         if let Some(node) = parser.get_node_at_position(tree, position) {
             parser.analyze_completion_context(node, sql, position)
         } else {
@@ -27,6 +29,7 @@ pub(super) fn completion(
     let is_join_clause = context == crate::parser::CompletionContext::JoinClause;
 
     let mut items = Vec::new();
+    let mut value_policy = None;
 
     // 根据上下文提供不同的补全
     match context {
@@ -35,9 +38,15 @@ pub(super) fn completion(
             let prefix = PostgresDialect::relation_reference_prefix(sql, position);
 
             if let Some(schema) = schema {
-                common::add_schema_tables(&mut items, schema, &prefix, true);
+                common::add_schema_tables(
+                    &mut items,
+                    schema,
+                    &prefix,
+                    true,
+                    PostgresDialect::cursor_has_identifier_qualifier(sql, position),
+                );
                 if is_join_clause {
-                    if let Some(tree) = &parse_result.tree {
+                    if let Some(tree) = &syntax_tree {
                         let referenced_tables =
                             parser.extract_referenced_tables_at_position(tree, sql, position);
                         let aliases = parser.extract_aliases_at_position(tree, sql, position);
@@ -55,7 +64,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::FromContinuationClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in [
                 "AS",
                 "JOIN",
@@ -81,7 +94,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::JoinConditionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in ["AS", "ON", "USING"] {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -93,15 +110,18 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::SelectClause => {
-            let prefix =
-                common::cursor_prefix_excluding_keywords(sql, position, &["select", "distinct"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["select", "distinct"],
+            );
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -136,7 +156,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::SelectContinuationClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in common::select_continuation_keywords(sql, position) {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -148,7 +172,8 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::WhereClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
                 sql,
                 position,
                 &["where", "and", "or", "not"],
@@ -157,20 +182,21 @@ pub(super) fn completion(
             let latest_predicate_clause = common::latest_predicate_clause(sql, position);
             if !predicate_operator_expected {
                 if let Some(schema) = schema {
-                    if let Some(tree) = &parse_result.tree {
+                    if let Some(tree) = &syntax_tree {
                         let referenced_tables = PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         );
                         let use_table_prefix =
                             !matches!(latest_predicate_clause, Some("SET" | "UPDATE"))
                                 && referenced_tables.len() > 1;
-                        common::add_column_value_items(
+                        value_policy = common::add_column_value_items(
                             &mut items,
                             schema,
                             &referenced_tables,
                             sql,
                             position,
                             &prefix,
+                            dialect.identity,
                         );
                         dialect.add_schema_columns(
                             &mut items,
@@ -239,11 +265,16 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::OrderByClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["order", "by"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["order", "by"],
+            );
             if let Some(schema) = schema {
-                if let Some(tree) = &parse_result.tree {
+                if let Some(tree) = &syntax_tree {
                     let referenced_tables = PostgresDialect::referenced_table_names_at_position(
-                        &parser, tree, sql, position,
+                        &parser, tree, sql, position, schema,
                     );
                     let use_table_prefix = referenced_tables.len() != 1;
                     dialect.add_schema_columns(
@@ -269,11 +300,16 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::GroupByClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["group", "by"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["group", "by"],
+            );
             if let Some(schema) = schema {
-                if let Some(tree) = &parse_result.tree {
+                if let Some(tree) = &syntax_tree {
                     let referenced_tables = PostgresDialect::referenced_table_names_at_position(
-                        &parser, tree, sql, position,
+                        &parser, tree, sql, position, schema,
                     );
                     let use_table_prefix = referenced_tables.len() != 1;
                     dialect.add_schema_columns(
@@ -289,7 +325,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::GroupByContinuationClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in [",", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH"] {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -305,7 +345,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::OrderDirectionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in common::order_direction_keywords(
                 sql,
                 position,
@@ -326,7 +370,8 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::HavingClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
                 sql,
                 position,
                 &["having", "and", "or", "not"],
@@ -334,9 +379,9 @@ pub(super) fn completion(
             let predicate_operator_expected = common::predicate_operator_expected(sql, position);
             if !predicate_operator_expected {
                 if let Some(schema) = schema {
-                    if let Some(tree) = &parse_result.tree {
+                    if let Some(tree) = &syntax_tree {
                         let referenced_tables = PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         );
                         let use_table_prefix = referenced_tables.len() != 1;
                         dialect.add_schema_columns(
@@ -393,11 +438,16 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::UsingClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["using"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["using"],
+            );
             if let Some(schema) = schema {
-                if let Some(tree) = &parse_result.tree {
+                if let Some(tree) = &syntax_tree {
                     let referenced_tables = PostgresDialect::referenced_table_names_at_position(
-                        &parser, tree, sql, position,
+                        &parser, tree, sql, position, schema,
                     );
                     common::add_schema_using_columns(
                         &mut items,
@@ -411,7 +461,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::ReferenceColumnClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             if let Some(schema) = schema {
                 if let Some(table_reference) = SqlParser::reference_table_at_position(sql, position)
                 {
@@ -427,7 +481,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::ReferenceActionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in [
                 "(",
                 "MATCH FULL",
@@ -449,7 +507,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::ReferenceRuleClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in [
                 "CASCADE",
                 "RESTRICT",
@@ -467,10 +529,15 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::ColumnTargetClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["column"]);
-            if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["column"],
+            );
+            if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
                 let referenced_tables = PostgresDialect::referenced_table_names_at_position(
-                    &parser, tree, sql, position,
+                    &parser, tree, sql, position, schema,
                 );
                 common::add_schema_columns(
                     &mut items,
@@ -484,10 +551,15 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::ConstraintTargetClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["constraint"]);
-            if let (Some(schema), Some(tree)) = (schema, &parse_result.tree) {
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["constraint"],
+            );
+            if let (Some(schema), Some(tree)) = (schema, &syntax_tree) {
                 let referenced_tables = PostgresDialect::referenced_table_names_at_position(
-                    &parser, tree, sql, position,
+                    &parser, tree, sql, position, schema,
                 );
                 common::add_schema_constraints(
                     &mut items,
@@ -500,7 +572,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::AlterTableActionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in [
                 "ADD COLUMN",
                 "DROP COLUMN",
@@ -521,7 +597,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::InsertActionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in [
                 "(",
                 "VALUES",
@@ -540,7 +620,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::InsertValueClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in [
                 "DEFAULT",
                 "NULL",
@@ -559,7 +643,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::InsertContinuationClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in ["ON CONFLICT", "RETURNING"] {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -571,15 +659,18 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::InsertConflictTargetClause => {
-            let prefix =
-                common::cursor_prefix_excluding_keywords(sql, position, &["on", "conflict"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["on", "conflict"],
+            );
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -595,14 +686,18 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::InsertConflictConstraintClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["constraint"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["constraint"],
+            );
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -617,7 +712,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::InsertConflictActionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             let text_before = common::text_before_position(sql, position).to_ascii_uppercase();
             let searchable = SqlParser::mask_sql_noise(&text_before);
             let in_do_tail = searchable
@@ -643,24 +742,28 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::ExpressionValueClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
-                common::add_column_value_items(
+                value_policy = common::add_column_value_items(
                     &mut items,
                     schema,
                     &referenced_tables,
                     sql,
                     position,
                     &prefix,
+                    dialect.identity,
                 );
             }
             let mut keywords = vec!["NULL", "TRUE", "FALSE", "CURRENT_DATE", "CURRENT_TIMESTAMP"];
@@ -678,14 +781,18 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::CaseResultClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["then", "else"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["then", "else"],
+            );
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -719,7 +826,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::CaseWhenValueContinuationClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in ["THEN"] {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -731,7 +842,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::CaseContinuationClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in common::case_continuation_keywords(sql, position) {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -743,7 +858,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::PredicateContinuationClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in common::predicate_continuation_keywords(sql, position, true) {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -755,7 +874,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::UpdateActionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in ["SET"] {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -767,7 +890,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::DeleteActionClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for keyword in ["WHERE", "USING", "RETURNING"] {
                 if !prefix.is_empty() && !keyword.to_lowercase().starts_with(&prefix) {
                     continue;
@@ -779,14 +906,18 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::IndexTargetClause => {
-            let prefix = common::cursor_prefix_excluding_keywords(sql, position, &["index"]);
+            let prefix = common::cursor_prefix_excluding_keywords_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+                &["index"],
+            );
             if let Some(schema) = schema {
-                let referenced_tables = parse_result
-                    .tree
+                let referenced_tables = syntax_tree
                     .as_ref()
                     .map(|tree| {
                         PostgresDialect::referenced_table_names_at_position(
-                            &parser, tree, sql, position,
+                            &parser, tree, sql, position, schema,
                         )
                     })
                     .unwrap_or_default();
@@ -802,7 +933,11 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::DataTypeClause => {
-            let prefix = common::cursor_prefix(sql, position);
+            let prefix = common::cursor_prefix_for_dialect(
+                crate::placeholder::SqlPlaceholderDialect::Postgres,
+                sql,
+                position,
+            );
             for data_type in [
                 "VARCHAR",
                 "TEXT",
@@ -827,22 +962,37 @@ pub(super) fn completion(
         }
 
         crate::parser::CompletionContext::TableColumn => {
-            if let Some(tree) = &parse_result.tree {
+            if let Some(tree) = &syntax_tree {
                 if let Some(table_name) =
                     common::table_column_reference_at_position(&parser, tree, sql, position)
                 {
                     if let Some(schema) = schema {
-                        let aliases = SqlParser::relation_aliases_at_position(sql, position);
-                        let real_table_name =
-                            SqlParser::resolve_relation_alias(&aliases, &table_name)
-                                .map(|alias| alias.relation.as_str())
-                                .unwrap_or(table_name.as_str());
+                        let aliases = snapshot.relation_aliases.clone().unwrap_or_else(|| {
+                            SqlParser::relation_aliases_at_position(sql, position)
+                        });
+                        let real_table_name = common::row_reference(schema, &aliases, &table_name);
                         if let Some(table) =
                             PostgresDialect::find_table_by_reference(schema, real_table_name)
                         {
                             for column in &table.columns {
                                 items.push(dialect.create_column_item(column, None));
                             }
+                        } else if SqlParser::resolve_relation_alias(&aliases, &table_name).is_none()
+                        {
+                            // An unresolved qualifier can name a schema function.
+                            // Keep this existing SELECT capability while editing
+                            // a qualified member prefix in the middle of a token.
+                            dialect.add_schema_functions(
+                                &mut items,
+                                schema,
+                                &common::cursor_prefix_for_dialect(
+                                    crate::placeholder::SqlPlaceholderDialect::Postgres,
+                                    sql,
+                                    position,
+                                ),
+                                "1",
+                                true,
+                            );
                         }
                     }
                 }
@@ -908,7 +1058,7 @@ pub(super) fn completion(
             }
 
             if let Some(schema) = schema {
-                common::add_schema_tables(&mut items, schema, "", true);
+                common::add_schema_tables(&mut items, schema, "", true, false);
                 dialect.add_schema_functions(
                     &mut items,
                     schema,
@@ -920,10 +1070,18 @@ pub(super) fn completion(
         }
     }
 
-    if let (Some(schema), Some(_)) = (schema, parse_result.tree.as_ref()) {
-        let aliases = SqlParser::relation_aliases_at_position(sql, position);
+    if let (Some(schema), Some(tree)) = (schema, syntax_tree.as_ref()) {
+        let aliases = snapshot
+            .relation_aliases
+            .clone()
+            .unwrap_or_else(|| SqlParser::relation_aliases_at_position(sql, position));
         common::apply_column_aliases(&mut items, schema, &aliases);
+        common::apply_scoped_column_completion(
+            &mut items, &parser, tree, sql, position, schema, &context,
+        );
     }
 
-    items
+    common::apply_value_completion_policy(&mut items, value_policy, dialect.identity);
+    snapshot.items = items;
+    snapshot
 }

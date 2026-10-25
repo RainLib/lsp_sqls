@@ -5,30 +5,29 @@ use super::code_actions::{
 };
 use super::completion_context::position_to_byte_offset;
 use super::completion_resolve::{defer_completion_documentation, resolve_completion_documentation};
-use super::diagnostics::document_diagnostics;
+use super::diagnostics::document_diagnostics_with_metadata;
 use super::document_structure::{document_symbols, folding_ranges, selection_range_for_position};
-use super::insert_hints::insert_value_hints;
+use super::insert_hints::insert_value_hints_with_metadata;
 use super::join_actions::add_join_condition_actions;
 use super::limits::{
     INLAY_HINT_MAX_ITEMS, PROJECT_SQL_INDEX_MAX_RESULTS, SIGNATURE_HELP_MAX_OVERLOADS,
 };
 use super::locations::{
-    cte_identifier_range_at_position, deduplicate_locations, rewrite_current_document_location_uri,
+    deduplicate_locations, rewrite_current_document_location_uri,
     rewrite_current_document_location_uris, supports_semantic_rename, valid_renamed_identifier,
     workspace_symbol_matches, workspace_symbol_rank,
 };
-use super::preferences::{
-    dialect_uses_sql_preferences, CompletionPreferences, FormattingPreferences, FromClauseLayout,
-};
+use super::preferences::{dialect_uses_sql_preferences, FromClauseLayout};
 use super::project_index::project_sql_symbol_container;
 use super::project_types::ProjectSqlSymbolRole;
 use super::routine_hints::routine_parameter_hints;
+use super::routine_identity::RoutineIdentity;
+use super::routine_overloads::rank_live_overloads;
 use super::runtime::SqlLspServer;
 use super::semantic_tokens::schema_semantic_tokens;
 use super::signature_help::{
     builtin_overload_accepts_call, builtin_signature_information, code_action_kind_available,
-    live_overload_accepts_call, live_signature_information, routine_call_at_position,
-    routine_names_match, single_document_edit,
+    live_signature_information, routine_call_at_position, single_document_edit,
 };
 use crate::builtin_signatures::builtin_signatures_for;
 use crate::dialects::common::apply_formatter_function_case;
@@ -67,11 +66,18 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
         let diagnostics = if let Some(dialect) = self.get_dialect_for_file(&uri) {
             let schema = self.get_schema_for_file(&uri);
-            document_diagnostics(&*dialect, &text, schema.as_ref()).await
+            document_diagnostics_with_metadata(
+                &*dialect,
+                &text,
+                schema.as_ref(),
+                Some(&self.schema_manager),
+            )
+            .await
         } else {
             Vec::new()
         };
@@ -87,230 +93,63 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        tracing::debug!("Received configuration change");
-        // 解析配置 JSON
-        if let Some(settings) = params.settings.as_object() {
-            // 处理 schemas 配置
-            if let Some(default_dialect_value) = settings.get("defaultDialect") {
-                if let Some(default_dialect) = default_dialect_value.as_str() {
-                    if self.dialect_registry.get_by_name(default_dialect).is_some() {
-                        if let Ok(mut current_default) = self.default_dialect.write() {
-                            *current_default = default_dialect.to_string();
-                        }
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!("Updated default dialect to {}", default_dialect),
-                            )
-                            .await;
-                    } else {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                format!(
-                                    "Ignoring unsupported default dialect: {}",
-                                    default_dialect
-                                ),
-                            )
-                            .await;
-                    }
-                }
-            }
-
-            if let Some(preferences_value) = settings.get("completionPreferences") {
-                match serde_json::from_value::<CompletionPreferences>(preferences_value.clone()) {
-                    Ok(preferences) => {
-                        if let Ok(mut current_preferences) = self.completion_preferences.write() {
-                            *current_preferences = preferences;
-                        }
-                    }
-                    Err(error) => {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                format!("Ignoring invalid completion preferences: {error}"),
-                            )
-                            .await;
-                    }
-                }
-            }
-
-            if let Some(preferences_value) = settings.get("formattingPreferences") {
-                match serde_json::from_value::<FormattingPreferences>(preferences_value.clone()) {
-                    Ok(preferences) => {
-                        if let Ok(mut current_preferences) = self.formatting_preferences.write() {
-                            *current_preferences = preferences;
-                        }
-                    }
-                    Err(error) => {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                format!("Ignoring invalid formatting preferences: {error}"),
-                            )
-                            .await;
-                    }
-                }
-            }
-
-            // 处理 schemas 配置
-            if let Some(schemas_value) = settings.get("schemas") {
-                if let Ok(schemas) =
-                    serde_json::from_value::<Vec<crate::schema::Schema>>(schemas_value.clone())
-                {
-                    // 清空旧的 schema 并注册新的
-                    self.schema_manager.clear();
-                    let count = schemas.len();
-                    for schema in schemas {
-                        self.schema_manager.register(schema);
-                    }
-                    self.inferred_file_schemas.clear();
-                    self.client
-                        .log_message(MessageType::INFO, format!("Updated {} schemas", count))
-                        .await;
-                } else {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            "Failed to parse schemas configuration",
-                        )
-                        .await;
-                }
-            }
-
-            // 处理文件到 schema 的映射配置
-            if let Some(file_schemas_value) = settings.get("fileSchemas") {
-                self.configured_file_schemas.clear();
-                self.inferred_file_schemas.clear();
-                if let Some(file_schemas_obj) = file_schemas_value.as_object() {
-                    for (uri, schema_id_str) in file_schemas_obj {
-                        if let Some(id_str) = schema_id_str.as_str() {
-                            if let Ok(schema_id) = id_str.parse::<crate::schema::SchemaId>() {
-                                self.configured_file_schemas.insert(uri.clone(), schema_id);
-                            }
-                        }
-                    }
-                    self.client
-                        .log_message(MessageType::INFO, "Updated file-schema mappings")
-                        .await;
-                }
-            }
-
-            // 处理文件到 dialect 的显式映射配置
-            if let Some(file_dialects_value) = settings.get("fileDialects") {
-                self.configured_file_dialects.clear();
-                if let Some(file_dialects_obj) = file_dialects_value.as_object() {
-                    for (uri, dialect_name) in file_dialects_obj {
-                        if let Some(name) = dialect_name.as_str() {
-                            if self.dialect_registry.get_by_name(name).is_some() {
-                                self.configured_file_dialects
-                                    .insert(uri.clone(), name.to_string());
-                            }
-                        }
-                    }
-                    self.client
-                        .log_message(MessageType::INFO, "Updated file-dialect mappings")
-                        .await;
-                }
-            }
-
-            self.inferred_file_dialects.clear();
-            self.ensure_dialects_for_open_documents();
-            self.publish_diagnostics_for_open_documents().await;
+        let messages = {
+            let mut revision = self.analysis.configuration.write().await;
+            let messages = self.apply_configuration(params.settings);
+            *revision = revision.wrapping_add(1);
+            messages
+        };
+        // Logging/backpressure must not retain the configuration write guard.
+        for (kind, message) in messages {
+            self.client.log_message(kind, message).await;
         }
+        self.publish_diagnostics_for_open_documents().await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
-        let text = params.text_document.text.clone();
-        let language_id = params.text_document.language_id.clone();
-
-        self.inferred_file_schemas.remove(&uri);
-
-        // 存储文档内容
-        self.document_manager
-            .update(uri.clone(), text.clone(), params.text_document.version);
-        self.document_languages
-            .insert(uri.clone(), language_id.clone());
-
-        // 尝试从 URI 和 languageId 推断方言。客户端显式配置的 fileDialects
-        // 优先级更高，因此只在当前文件没有映射时写入推断结果。
-        self.ensure_dialect_for_document(&uri, &language_id);
-
-        // 发布诊断
-        if let Some(dialect) = self.get_dialect_for_file(&uri) {
-            let schema = self.get_schema_for_file(&uri);
-            let diagnostics = document_diagnostics(&*dialect, &text, schema.as_ref()).await;
-            self.client
-                .publish_diagnostics(
-                    params.text_document.uri,
-                    diagnostics,
-                    self.document_manager.version(&uri),
-                )
-                .await;
+        {
+            let _analysis = self.analysis.configuration.read().await;
+            self.inferred_file_schemas.remove(&uri);
+            self.document_manager.update(
+                uri.clone(),
+                params.text_document.text,
+                params.text_document.version,
+            );
+            self.document_languages
+                .insert(uri.clone(), params.text_document.language_id.clone());
+            self.ensure_dialect_for_document(&uri, &params.text_document.language_id);
         }
+        self.publish_document_diagnostics(&uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
-        self.inferred_file_schemas.remove(&uri);
-
-        // 处理增量同步
-        for change in params.content_changes {
-            if let Some(range) = change.range {
-                // 增量更新：应用部分文本变更
-                if let Some(mut current_text) = self.document_manager.get(&uri) {
-                    // 将 LSP Range 转换为字节偏移
-                    let start_offset = self.position_to_offset(&current_text, range.start);
-                    let end_offset = self.position_to_offset(&current_text, range.end);
-
-                    // 应用变更
-                    current_text.replace_range(start_offset..end_offset, &change.text);
-                    self.document_manager.update(
-                        uri.clone(),
-                        current_text.clone(),
-                        params.text_document.version,
-                    );
-
-                    // 重新解析并发布诊断
-                    if let Some(dialect) = self.get_dialect_for_file(&uri) {
-                        let schema = self.get_schema_for_file(&uri);
-                        let diagnostics =
-                            document_diagnostics(&*dialect, &current_text, schema.as_ref()).await;
-                        self.client
-                            .publish_diagnostics(
-                                params.text_document.uri.clone(),
-                                diagnostics,
-                                self.document_manager.version(&uri),
-                            )
-                            .await;
+        {
+            let _analysis = self.analysis.configuration.read().await;
+            self.inferred_file_schemas.remove(&uri);
+            let mut text = self.document_manager.get(&uri);
+            for change in params.content_changes {
+                if let Some(range) = change.range {
+                    if let Some(current) = text.as_mut() {
+                        let start = self.position_to_offset(current, range.start);
+                        let end = self.position_to_offset(current, range.end);
+                        current.replace_range(start..end, &change.text);
                     }
-                }
-            } else {
-                // 完整文档更新
-                let text = change.text.clone();
-                self.document_manager.update(
-                    uri.clone(),
-                    text.clone(),
-                    params.text_document.version,
-                );
-
-                if let Some(dialect) = self.get_dialect_for_file(&uri) {
-                    let schema = self.get_schema_for_file(&uri);
-                    let diagnostics = document_diagnostics(&*dialect, &text, schema.as_ref()).await;
-                    self.client
-                        .publish_diagnostics(
-                            params.text_document.uri.clone(),
-                            diagnostics,
-                            self.document_manager.version(&uri),
-                        )
-                        .await;
+                } else {
+                    text = Some(change.text);
                 }
             }
+            if let Some(text) = text {
+                self.document_manager
+                    .update(uri.clone(), text, params.text_document.version);
+            }
         }
+        self.publish_document_diagnostics(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         // 清理文档
         self.document_manager.remove(&uri);
@@ -322,12 +161,13 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document_position.text_document.uri.to_string();
         let position = params.text_document_position.position;
 
         let text = self.document_manager.get(&uri).unwrap_or_default();
 
-        let Some(mut items) = self
+        let Some(mut candidates) = self
             .completion_candidates_at(&uri, &text, position, params.context.as_ref())
             .await
         else {
@@ -338,12 +178,19 @@ impl LanguageServer for SqlLspServer {
             .load(Ordering::Relaxed)
         {
             defer_completion_documentation(
-                &mut items,
+                &mut candidates.items,
                 &self.completion_resolve_cache,
                 &self.next_completion_resolve_id,
             );
         }
-        Ok(Some(CompletionResponse::Array(items)))
+        Ok(Some(if candidates.is_incomplete {
+            CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items: candidates.items,
+            })
+        } else {
+            CompletionResponse::Array(candidates.items)
+        }))
     }
 
     async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
@@ -354,6 +201,7 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params
             .text_document_position_params
             .text_document
@@ -375,6 +223,7 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        let _analysis = self.analysis.configuration.read().await;
         let document_uri = params.text_document_position_params.text_document.uri;
         let uri = document_uri.to_string();
         let position = params.text_document_position_params.position;
@@ -382,6 +231,18 @@ impl LanguageServer for SqlLspServer {
         let text = self.document_manager.get(&uri).unwrap_or_default();
 
         if let Some(dialect) = self.get_dialect_for_file(&uri) {
+            if let Some(resolved) = super::document_cte_locations::resolve_cte(
+                &text,
+                &document_uri,
+                position,
+                dialect.name(),
+                true,
+            ) {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: document_uri,
+                    range: resolved.definition,
+                })));
+            }
             let schema = self.get_schema_for_position(&uri, &text, position);
             if let Some(mut location) = dialect
                 .goto_definition(&text, position, schema.as_ref())
@@ -406,6 +267,7 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let _analysis = self.analysis.configuration.read().await;
         let document_uri = params.text_document_position.text_document.uri;
         let uri = document_uri.to_string();
         let position = params.text_document_position.position;
@@ -414,6 +276,15 @@ impl LanguageServer for SqlLspServer {
         let text = self.document_manager.get(&uri).unwrap_or_default();
 
         if let Some(dialect) = self.get_dialect_for_file(&uri) {
+            if let Some(resolved) = super::document_cte_locations::resolve_cte(
+                &text,
+                &document_uri,
+                position,
+                dialect.name(),
+                include_declarations,
+            ) {
+                return Ok(Some(resolved.locations));
+            }
             let schema = self.get_schema_for_position(&uri, &text, position);
             let mut locations = dialect.references(&text, position, schema.as_ref()).await;
             rewrite_current_document_location_uris(&mut locations, &document_uri);
@@ -435,6 +306,7 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params
             .text_document_position_params
             .text_document
@@ -442,41 +314,88 @@ impl LanguageServer for SqlLspServer {
             .to_string();
         let position = params.text_document_position_params.position;
         let text = self.document_manager.get(&uri).unwrap_or_default();
-        let Some(call) = routine_call_at_position(&text, position) else {
+        let dialect = self
+            .dialect_identity_for_file(&uri)
+            .or_else(|| {
+                self.get_dialect_for_file(&uri)
+                    .map(|dialect| dialect.name().into())
+            })
+            .unwrap_or_else(|| self.default_dialect_name());
+        let Some(call) = routine_call_at_position(&text, position, &dialect) else {
             return Ok(None);
         };
-        let schema = self.get_schema_for_position(&uri, &text, position);
+        let Some(identity) = RoutineIdentity::parse(&call.name, &dialect) else {
+            return Ok(None);
+        };
+        let current = self.get_schema_for_file(&uri);
+        let schema = identity.schema(current.as_ref(), &self.schema_manager, &dialect);
         let mut live_overloads = schema
             .as_ref()
             .map(|schema| {
                 schema
                     .functions
                     .iter()
-                    .filter(|function| routine_names_match(&function.name, &call.name))
+                    .filter(|function| {
+                        identity.matches(function, &dialect)
+                            && super::routine_parameters::routine_kind_matches(
+                                function,
+                                call.procedure_call,
+                            )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        live_overloads.sort_by_key(|function| !live_overload_accepts_call(function, &call));
+        let argument_types = if live_overloads.len() > 1
+            && call.active_group == 0
+            && text.len() <= super::local_relations::LOCAL_RELATION_SCAN_MAX_BYTES
+            && !call.arguments.is_empty()
+        {
+            self.get_schema_for_position(&uri, &text, position)
+                .map(|inputs| {
+                    super::local_relations::infer_routine_argument_types(
+                        &text,
+                        &call.arguments,
+                        &inputs,
+                        &uri,
+                        position_to_byte_offset(&text, position),
+                        &dialect,
+                        Some(&self.schema_manager),
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        rank_live_overloads(
+            &mut live_overloads,
+            &call,
+            &argument_types.types,
+            argument_types.complete_arity,
+            if argument_types.complete_arity.is_some() {
+                argument_types.explicit_variadic
+            } else {
+                call.explicit_variadic
+            },
+            &dialect,
+        );
         live_overloads.truncate(SIGNATURE_HELP_MAX_OVERLOADS);
 
         let mut signatures = live_overloads
             .iter()
             .filter(|_| call.active_group == 0)
-            .map(|function| live_signature_information(function, &call))
+            .map(|function| live_signature_information(function, &call, &dialect))
             .collect::<Vec<_>>();
-        if signatures.is_empty() {
-            let dialect = self
-                .dialect_identity_for_file(&uri)
-                .or_else(|| {
-                    self.get_dialect_for_file(&uri)
-                        .map(|dialect| dialect.name().into())
-                })
-                .unwrap_or_else(|| self.default_dialect_name());
+        if signatures.is_empty()
+            && !call.procedure_call
+            && !call.supplied.has_named()
+            && identity.permits_builtin(&dialect)
+        {
             let mut builtins = builtin_signatures_for(
                 &dialect,
-                &call.name,
-                schema.as_ref().and_then(Schema::server_version_tuple),
+                identity.name(),
+                schema.as_deref().and_then(Schema::server_version_tuple),
             );
+            builtins.retain(|signature| identity.matches_builtin(&signature.name, &dialect));
             builtins.sort_by_key(|signature| !builtin_overload_accepts_call(signature, &call));
             builtins.truncate(SIGNATURE_HELP_MAX_OVERLOADS);
             signatures = builtins
@@ -487,13 +406,11 @@ impl LanguageServer for SqlLspServer {
         if signatures.is_empty() {
             return Ok(None);
         }
-        let active_parameter = signatures[0]
-            .active_parameter
-            .unwrap_or(call.active_parameter);
+        let active_parameter = signatures[0].active_parameter;
         Ok(Some(SignatureHelp {
             signatures,
             active_signature: Some(0),
-            active_parameter: Some(active_parameter),
+            active_parameter,
         }))
     }
 
@@ -501,11 +418,21 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
         let Some(dialect) = self.get_dialect_for_file(&uri) else {
             return Ok(None);
         };
+        if let Some(resolved) = super::document_cte_locations::resolve_cte(
+            &text,
+            &params.text_document.uri,
+            params.position,
+            dialect.name(),
+            true,
+        ) {
+            return Ok(Some(PrepareRenameResponse::Range(resolved.selected)));
+        }
         if !supports_semantic_rename(dialect.name()) {
             return Ok(None);
         }
@@ -515,56 +442,48 @@ impl LanguageServer for SqlLspServer {
                 .project_sql_symbol_is_renameable(&uri, dialect.name(), schema.as_ref(), &target)
                 .then_some(PrepareRenameResponse::Range(target.range)));
         }
-        let Some(range) = cte_identifier_range_at_position(&text, params.position, dialect.name())
-        else {
-            return Ok(None);
-        };
-        let schema = self.get_schema_for_position(&uri, &text, params.position);
-        Ok((!dialect
-            .references(&text, params.position, schema.as_ref())
-            .await
-            .is_empty())
-        .then_some(PrepareRenameResponse::Range(range)))
+        Ok(None)
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document_position.text_document.uri.to_string();
         let position = params.text_document_position.position;
         let text = self.document_manager.get(&uri).unwrap_or_default();
         let Some(dialect) = self.get_dialect_for_file(&uri) else {
             return Ok(None);
         };
-        if !supports_semantic_rename(dialect.name()) || !valid_renamed_identifier(&params.new_name)
-        {
+        if !valid_renamed_identifier(&params.new_name) {
             return Ok(None);
         }
-        let schema = self.get_schema_for_position(&uri, &text, position);
-        let target = self.project_sql_symbol_at_position(&uri, &text, position);
-        if target.is_none()
-            && cte_identifier_range_at_position(&text, position, dialect.name()).is_some()
-        {
-            let mut locations = dialect.references(&text, position, schema.as_ref()).await;
-            let Ok(document_uri) = Url::parse(&uri) else {
-                return Ok(None);
-            };
-            rewrite_current_document_location_uris(&mut locations, &document_uri);
-            deduplicate_locations(&mut locations);
-            let edits = locations
-                .into_iter()
-                .map(|location| TextEdit {
-                    range: location.range,
-                    new_text: params.new_name.clone(),
-                })
-                .collect::<Vec<_>>();
-            if edits.is_empty() {
-                return Ok(None);
-            }
+        if let Some(resolved) = super::document_cte_locations::resolve_cte(
+            &text,
+            &params.text_document_position.text_document.uri,
+            position,
+            dialect.name(),
+            true,
+        ) {
             return Ok(Some(WorkspaceEdit {
-                changes: Some(HashMap::from([(document_uri, edits)])),
+                changes: Some(HashMap::from([(
+                    params.text_document_position.text_document.uri,
+                    resolved
+                        .locations
+                        .into_iter()
+                        .map(|location| TextEdit {
+                            range: location.range,
+                            new_text: params.new_name.clone(),
+                        })
+                        .collect(),
+                )])),
                 document_changes: None,
                 change_annotations: None,
             }));
         }
+        if !supports_semantic_rename(dialect.name()) {
+            return Ok(None);
+        }
+        let schema = self.get_schema_for_position(&uri, &text, position);
+        let target = self.project_sql_symbol_at_position(&uri, &text, position);
         let Some(target) = target else {
             return Ok(None);
         };
@@ -598,6 +517,7 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri;
         let uri_string = uri.to_string();
         let text = self.document_manager.get(&uri_string).unwrap_or_default();
@@ -655,6 +575,26 @@ impl LanguageServer for SqlLspServer {
             .iter()
             .filter(|_| code_action_kind_available(&params.context, &CodeActionKind::QUICKFIX))
         {
+            if matches!(diagnostic.code.as_ref(),Some(NumberOrString::String(code)) if code=="OXIDE004")
+            {
+                for mut action in qualify_identifier_actions(
+                    &text,
+                    &uri,
+                    Range::new(diagnostic.range.end, diagnostic.range.end),
+                    schema.as_ref(),
+                    &dialect_identity,
+                ) {
+                    if !action.title.starts_with("Qualify column as ") {
+                        continue;
+                    }
+                    actions.retain(|existing|!matches!(existing,CodeActionOrCommand::CodeAction(e) if e.kind==Some(CodeActionKind::REFACTOR_REWRITE)&&e.edit==action.edit));
+                    action.kind = Some(CodeActionKind::QUICKFIX);
+                    action.is_preferred = Some(false);
+                    action.diagnostics = Some(vec![diagnostic.clone()]);
+                    actions.push(CodeActionOrCommand::CodeAction(action));
+                }
+                continue;
+            }
             if matches!(
                 diagnostic.code.as_ref(),
                 Some(NumberOrString::String(code)) if code == "OXIDE001"
@@ -683,6 +623,7 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
 
@@ -725,6 +666,7 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: DocumentRangeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
         let Some(dialect) = self.get_dialect_for_file(&uri) else {
@@ -763,6 +705,7 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
         let project_symbols = self.project_sql_index_for_document(&uri, &text);
@@ -775,6 +718,7 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        let _analysis = self.analysis.configuration.read().await;
         let text = self
             .document_manager
             .get(params.text_document.uri.as_str())
@@ -786,6 +730,7 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
         let dialect_name = self
@@ -805,6 +750,7 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
         let schema = self.get_schema_for_file(&uri);
@@ -815,13 +761,28 @@ impl LanguageServer for SqlLspServer {
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let _analysis = self.analysis.configuration.read().await;
         let uri = params.text_document.uri.to_string();
         let text = self.document_manager.get(&uri).unwrap_or_default();
-        let Some(schema) = self.get_schema_for_file(&uri) else {
-            return Ok(Some(Vec::new()));
-        };
-        let mut hints = insert_value_hints(&text, params.range, &schema);
-        hints.extend(routine_parameter_hints(&text, params.range, &schema));
+        let schema = self.get_schema_for_file(&uri);
+        let mut hints = insert_value_hints_with_metadata(
+            &text,
+            params.range,
+            schema.as_ref(),
+            Some(&self.schema_manager),
+        );
+        let dialect = self
+            .dialect_identity_for_file(&uri)
+            .unwrap_or_else(|| self.default_dialect_name());
+        if let Some(schema) = schema.as_ref() {
+            hints.extend(routine_parameter_hints(
+                &text,
+                params.range,
+                schema,
+                &self.schema_manager,
+                &dialect,
+            ));
+        }
         hints.sort_by_key(|hint| (hint.position.line, hint.position.character));
         hints.truncate(INLAY_HINT_MAX_ITEMS);
         Ok(Some(hints))
@@ -832,6 +793,7 @@ impl LanguageServer for SqlLspServer {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
+        let _analysis = self.analysis.configuration.read().await;
         let query = params.query.trim().to_ascii_lowercase();
         let mut symbols = Vec::new();
         for schema_id in self.schema_manager.list_ids() {

@@ -1,4 +1,86 @@
 use super::*;
+use crate::server::completion_context::checked_position_to_byte_offset;
+
+#[test]
+fn checked_snapshot_positions_preserve_utf16_and_line_break_boundaries() {
+    let text = "α😀b\r\n漢字c\rtail\n";
+    for (line, character, expected) in [
+        (0, 0, Some(0)),
+        (0, 1, Some(2)),
+        (0, 2, None),
+        (0, 3, Some(6)),
+        (0, 4, Some(7)),
+        (0, 5, None),
+        (1, 0, Some(9)),
+        (1, 3, Some(16)),
+        (1, 4, None),
+        (2, 2, Some(19)),
+        (3, 0, Some(text.len())),
+        (3, 1, None),
+        (4, 0, None),
+    ] {
+        assert_eq!(
+            checked_position_to_byte_offset(text, Position::new(line, character)),
+            expected,
+            "{line}:{character}"
+        );
+    }
+    assert_eq!(
+        checked_position_to_byte_offset("", Position::new(0, 0)),
+        Some(0)
+    );
+    assert_eq!(
+        checked_position_to_byte_offset("", Position::new(1, 0)),
+        None
+    );
+}
+
+#[test]
+fn cursor_offsets_clamp_at_unicode_line_ends_for_crlf_and_lone_cr() {
+    let text = "α😀b\r\n漢字c\rtail\nfin";
+    for (line, character, expected) in [
+        (0, 0, 0),
+        (0, 1, 2),
+        (0, 2, 2),
+        (0, 3, 6),
+        (0, 4, 7),
+        (0, 99, 7),
+        (1, 0, 9),
+        (1, 1, 12),
+        (1, 2, 15),
+        (1, 99, 16),
+        (2, 2, 19),
+        (2, 99, 21),
+        (3, 99, 25),
+        (99, 0, 25),
+    ] {
+        assert_eq!(
+            position_to_byte_offset(text, Position::new(line, character)),
+            expected,
+            "{line}:{character}"
+        );
+    }
+}
+
+#[test]
+fn cursor_prefix_offsets_report_cost_independent_of_unvisited_suffixes() {
+    let prefix = "SELECT /*😀*/ value IS ";
+    let position = crate::position::lsp_position_at_end(prefix);
+    for size in [4000usize, 64000, 600000] {
+        let text = prefix.to_string() + &" ".repeat(size);
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(
+                position_to_byte_offset(std::hint::black_box(&text), position),
+                prefix.len()
+            );
+        }
+        println!(
+            "cursor-prefix suffix_bytes={size} iterations=100 elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
+}
 
 #[test]
 fn lsp_position_offsets_use_utf16_characters_and_byte_boundaries() {

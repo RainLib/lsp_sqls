@@ -8,6 +8,7 @@ pub(super) fn hover(
     position: Position,
     schema: Option<&Schema>,
 ) -> Option<Hover> {
+    let position = SqlParser::lsp_position_to_byte_position(sql, position);
     let mut parser = dialect.parser.lock().unwrap();
     let parse_result = parser.parse(sql);
 
@@ -23,18 +24,20 @@ pub(super) fn hover(
                 return None;
             }
 
-            let is_table = node_kind == "table_name"
-                || node_kind == "table_reference"
-                || node_kind == "table_identifier"
-                || (node_kind == "identifier" && parser.is_in_from_context(node, sql));
+            let relation = crate::dialects::common::relation_reference_node(node);
+            let is_table = relation.kind() == "object_reference"
+                && relation
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "relation");
 
             if is_table {
-                let table_ref = SqlParser::normalize_identifier(&node_text);
+                let table_ref = parser.node_text(relation, sql);
                 if let Some(table) = PostgresDialect::find_table_by_reference(schema, &table_ref) {
                     return Some(Hover {
                         contents: tower_lsp::lsp_types::HoverContents::Scalar(
                             MarkedString::String(format!(
-                                "PostgreSQL Table: {}.{}\n{}",
+                                "{} Table: {}.{}\n{}",
+                                dialect.display_name(),
                                 schema.database,
                                 table.name,
                                 table
@@ -53,35 +56,27 @@ pub(super) fn hover(
                 || (node_kind == "identifier" && parser.is_in_column_context(node, sql));
 
             if is_column {
-                let table_name = parser.get_table_name_for_column(node, sql);
-                let column_name = SqlParser::identifier_last_part(&node_text);
-
-                for table in &schema.tables {
-                    if let Some(ref table_ref) = table_name {
-                        if !PostgresDialect::table_matches(schema, table, table_ref) {
-                            continue;
-                        }
-                    }
-
-                    if let Some(column) = table
-                        .columns
-                        .iter()
-                        .find(|column| column.name == column_name)
-                    {
-                        return Some(Hover {
-                            contents: tower_lsp::lsp_types::HoverContents::Scalar(
-                                MarkedString::String(format!(
-                                    "PostgreSQL Column: {}.{}\n{}",
-                                    table.name,
-                                    column.name,
-                                    column
-                                        .documentation()
-                                        .unwrap_or_else(|| "No description".to_string())
-                                )),
-                            ),
-                            range: Some(parser.node_range(node)),
-                        });
-                    }
+                if let Some((table, column)) = crate::dialects::common::column_at_position(
+                    &parser, tree, node, sql, position, schema,
+                ) {
+                    return Some(Hover {
+                        contents: tower_lsp::lsp_types::HoverContents::Scalar(
+                            MarkedString::String(format!(
+                                "{} Column: {}{}\n{}",
+                                dialect.display_name(),
+                                if table.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("{table}.")
+                                },
+                                column.name,
+                                column
+                                    .documentation()
+                                    .unwrap_or_else(|| "No description".to_string())
+                            )),
+                        ),
+                        range: Some(parser.node_range(node)),
+                    });
                 }
             }
 

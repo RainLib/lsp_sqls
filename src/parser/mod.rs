@@ -6,4 +6,8 @@ pub mod dsl;
 pub mod sql;
 
 pub use dsl::{DslCompletionContext, DslParser};
-pub use sql::{AstNode, CompletionContext, ParseResult, RelationAlias, SqlParser};
+pub(crate) use sql::LateralView;
+pub use sql::{
+    AstNode, CompletionContext, JoinExpr, JoinKind, ParseResult, RelationAlias, RelationScope,
+    SqlParser,
+};

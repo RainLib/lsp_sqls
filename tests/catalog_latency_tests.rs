@@ -10,6 +10,8 @@ const MAX_COLD_COMPLETION: Duration = Duration::from_secs(5);
 fn large_schema() -> Schema {
     Schema {
         id: SchemaId::new(),
+        server: None,
+        namespace: None,
         catalog: None,
         database: "analytics".to_string(),
         server_version: None,

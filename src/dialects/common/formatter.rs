@@ -16,7 +16,16 @@ pub(crate) fn format_sql_pretty_with_keyword_case(source: &str, uppercase: Optio
     sqlformat::format(source, &QueryParams::None, &options)
 }
 
-fn collect_invocation_name_ranges(node: tree_sitter::Node<'_>, ranges: &mut Vec<(usize, usize)>) {
+fn collect_invocation_name_ranges(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    if node.kind() == "cast" {
+        if let Some(range) = SqlParser::try_cast_name_range(node, source) {
+            ranges.push(range);
+        }
+    }
     if node.kind() == "invocation" {
         let mut cursor = node.walk();
         if let Some(reference) = node
@@ -31,7 +40,7 @@ fn collect_invocation_name_ranges(node: tree_sitter::Node<'_>, ranges: &mut Vec<
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_invocation_name_ranges(child, ranges);
+        collect_invocation_name_ranges(child, source, ranges);
     }
 }
 
@@ -48,7 +57,7 @@ pub(crate) fn apply_formatter_function_case(source: &str, uppercase: Option<bool
         return source.to_string();
     };
     let mut ranges = Vec::new();
-    collect_invocation_name_ranges(tree.root_node(), &mut ranges);
+    collect_invocation_name_ranges(tree.root_node(), source, &mut ranges);
     ranges.sort_unstable();
     ranges.dedup();
 
@@ -98,7 +107,7 @@ pub(crate) fn apply_formatter_layout(
     if logical_operator_layout != LogicalOperatorLayout::Before {
         let mut rewritten_lines = Vec::with_capacity(lines.len());
         let mut rewritten_masked_lines = Vec::with_capacity(masked_lines.len());
-        for (current, masked_line) in lines.into_iter().zip(masked_lines.into_iter()) {
+        for (current, masked_line) in lines.into_iter().zip(masked_lines) {
             let leading = masked_line.len() - masked_line.trim_start().len();
             let trimmed_upper = masked_line[leading..].to_ascii_uppercase();
             let operator_len = ["AND", "OR", "XOR"]

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
+mod namespace;
+pub use namespace::NamespaceContext;
 
 /// Schema ID，用于隔离不同的 schema 数据
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -33,6 +35,14 @@ impl Default for SchemaId {
 pub struct Schema {
     /// Schema ID
     pub id: SchemaId,
+    /// Explicit server identity for multipart references; never inferred from
+    /// an unrelated connection host or discarded during catalog matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// Effective lookup schema and snapshot coverage, supplied by session
+    /// metadata rather than inferred from an explorer selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<NamespaceContext>,
     /// Optional catalog/database namespace above the SQL schema. This is
     /// required to disambiguate same-named schemas and tables across catalogs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +212,8 @@ pub struct Function {
 /// 函数参数信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionParameter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// 参数名
     pub name: String,
     /// 参数类型
@@ -211,6 +223,20 @@ pub struct FunctionParameter {
 }
 
 impl FunctionParameter {
+    pub(crate) fn mode_name(&self) -> Option<&'static str> {
+        let mode = self.mode.as_deref()?.trim();
+        [
+            ("IN", "i"),
+            ("OUT", "o"),
+            ("INOUT", "b"),
+            ("VARIADIC", "v"),
+            ("TABLE", "t"),
+            ("RETURN", "return"),
+        ]
+        .into_iter()
+        .find(|(name, short)| mode.eq_ignore_ascii_case(name) || mode.eq_ignore_ascii_case(short))
+        .map(|(name, _)| name)
+    }
     pub fn signature_label(&self) -> String {
         let data_type = self.data_type.trim();
         let name = self.name.trim();
@@ -220,6 +246,10 @@ impl FunctionParameter {
             name.to_string()
         } else {
             format!("{name} {data_type}")
+        };
+        let label = match self.mode_name() {
+            Some(mode) if mode != "IN" => format!("{mode} {label}"),
+            _ => label,
         };
         if self.optional {
             format!("[{label}]")
@@ -495,6 +525,52 @@ impl SchemaManager {
         self.schemas.get(&id).map(|s| s.clone())
     }
 
+    /// Clone metadata only after confirming there is exactly one match.
+    pub(crate) fn find_unique(&self, matches: impl Fn(&Schema) -> bool) -> Option<Schema> {
+        let mut found = None;
+        for candidate in self.schemas.iter() {
+            if !matches(candidate.value()) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(candidate);
+        }
+        found.map(|candidate| candidate.value().clone())
+    }
+
+    /// Keep catalog snapshots borrowed while checking identity and ambiguity;
+    /// copy only the selected row shape, never the entire matching catalog.
+    pub(crate) fn find_unique_table(
+        &self,
+        scope: impl Fn(&Schema) -> bool,
+        matches: impl Fn(&Schema, &Table) -> bool,
+    ) -> Option<Table> {
+        let mut found = None;
+        for candidate in self.schemas.iter() {
+            if !scope(&candidate) {
+                continue;
+            }
+            let mut index = None;
+            for (i, table) in candidate.tables.iter().enumerate() {
+                if matches(&candidate, table) {
+                    if index.is_some() {
+                        return None;
+                    }
+                    index = Some(i);
+                }
+            }
+            if let Some(index) = index {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((candidate, index));
+            }
+        }
+        found.map(|(schema, index)| schema.tables[index].clone())
+    }
+
     /// 更新 schema
     pub fn update(&self, id: SchemaId, schema: Schema) -> bool {
         if self.schemas.contains_key(&id) {
@@ -548,6 +624,8 @@ mod tests {
 
         let schema = Schema {
             id: SchemaId::new(),
+            server: None,
+            namespace: None,
             catalog: None,
             database: "test_db".to_string(),
             server_version: None,
@@ -588,6 +666,8 @@ mod tests {
     fn server_versions_support_vendor_prefixes_and_minor_gates() {
         let mut schema = Schema {
             id: SchemaId::new(),
+            server: None,
+            namespace: None,
             catalog: None,
             database: "default".to_string(),
             server_version: Some("Elasticsearch 8.14.1".to_string()),
@@ -610,6 +690,8 @@ mod tests {
 
         let schema1 = Schema {
             id: SchemaId::new(),
+            server: None,
+            namespace: None,
             catalog: None,
             database: "db1".to_string(),
             server_version: None,
@@ -620,6 +702,8 @@ mod tests {
 
         let schema2 = Schema {
             id: SchemaId::new(),
+            server: None,
+            namespace: None,
             catalog: None,
             database: "db2".to_string(),
             server_version: None,
