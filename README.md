@@ -30,7 +30,7 @@ A **high-performance**, **multi-dialect** SQL Language Server Protocol (LSP) imp
 
 ```bash
 # Build from source
-git clone https://github.com/your-org/lsp_sqls.git
+git clone https://github.com/RainLib/lsp_sqls.git
 cd lsp_sqls
 cargo build --release
 
